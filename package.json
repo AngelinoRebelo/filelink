@@ -1,0 +1,24 @@
+{
+  "name": "filelink",
+  "version": "1.0.0",
+  "description": "Transferência de arquivos P2P via rede temporária (WebRTC)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "webrtc",
+    "file-transfer",
+    "p2p",
+    "railway"
+  ],
+  "license": "MIT"
+}

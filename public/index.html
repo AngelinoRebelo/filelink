@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="FileLink — crie uma rede e envie arquivos entre aparelhos sem nuvem." />
+    <meta name="theme-color" content="#0b1f1a" />
+    <title>FileLink</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Manrope:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">FileLink</span>
+      </div>
+      <p class="status" id="connectionStatus">Conectando…</p>
+    </header>
+
+    <main>
+      <section class="hero" id="lobby">
+        <h1 class="logo">FileLink</h1>
+        <p class="tagline">Crie uma rede temporária e envie arquivos direto entre aparelhos na mesma sessão.</p>
+
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="createBtn">Criar rede</button>
+          <button type="button" class="btn btn-ghost" id="joinToggleBtn">Entrar com código</button>
+        </div>
+
+        <form class="join-form hidden" id="joinForm">
+          <label for="codeInput">Código da rede</label>
+          <div class="join-row">
+            <input
+              id="codeInput"
+              name="code"
+              maxlength="6"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="ABC123"
+              inputmode="text"
+            />
+            <button type="submit" class="btn btn-primary">Entrar</button>
+          </div>
+        </form>
+
+        <p class="hint">Os arquivos passam de aparelho para aparelho. O servidor só conecta a sessão.</p>
+      </section>
+
+      <section class="room hidden" id="room">
+        <div class="room-head">
+          <div>
+            <p class="eyebrow">Rede ativa</p>
+            <h2 class="room-code" id="roomCode">————</h2>
+          </div>
+          <div class="room-actions">
+            <button type="button" class="btn btn-ghost" id="copyBtn">Copiar código</button>
+            <button type="button" class="btn btn-ghost" id="shareBtn">Compartilhar link</button>
+            <button type="button" class="btn btn-danger" id="leaveBtn">Sair</button>
+          </div>
+        </div>
+
+        <p class="room-help">Abra este site no outro aparelho e entre com o mesmo código.</p>
+
+        <div class="peers" id="peers"></div>
+
+        <div class="transfer-panel">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <input type="file" id="fileInput" multiple hidden />
+            <strong>Solte arquivos aqui</strong>
+            <span>ou toque para escolher</span>
+          </label>
+
+          <div class="send-row">
+            <label for="targetSelect">Enviar para</label>
+            <select id="targetSelect" disabled>
+              <option value="">Aguardando aparelhos…</option>
+            </select>
+            <button type="button" class="btn btn-primary" id="sendBtn" disabled>Enviar</button>
+          </div>
+        </div>
+
+        <ul class="transfers" id="transfers" aria-live="polite"></ul>
+      </section>
+    </main>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
