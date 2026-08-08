@@ -188,48 +188,60 @@ function formatSpeed(bytesPerSecond) {
 }
 
 function formatEta(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return "calculando…";
-  if (seconds < 1) return "< 1s";
-  if (seconds < 60) return `${Math.ceil(seconds)}s restantes`;
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.ceil(seconds % 60);
+  if (!Number.isFinite(seconds) || seconds < 0) return "calculando tempo…";
+  const whole = Math.max(0, Math.ceil(seconds));
+  if (whole <= 1) return "faltam < 1s para acabar";
+  if (whole < 60) return `faltam ${whole}s para acabar`;
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
   if (mins < 60) {
-    return secs > 0 ? `${mins}m ${secs}s restantes` : `${mins}m restantes`;
+    return secs > 0
+      ? `faltam ${mins}m ${secs}s para acabar`
+      : `faltam ${mins}m para acabar`;
   }
   const hours = Math.floor(mins / 60);
   const remMins = mins % 60;
-  return remMins > 0 ? `${hours}h ${remMins}m restantes` : `${hours}h restantes`;
+  return remMins > 0
+    ? `faltam ${hours}h ${remMins}m para acabar`
+    : `faltam ${hours}h para acabar`;
 }
 
-function createSpeedMeter() {
+/** Stable ETA for the whole transfer job (all files), based on average throughput. */
+function createOperationMeter(totalBytes) {
   const startedAt = performance.now();
-  let lastAt = startedAt;
-  let lastBytes = 0;
-  let instant = 0;
+  let completedBytes = 0;
+  let lastUiAt = 0;
 
   return {
-    update(bytes, total = 0) {
+    get totalBytes() {
+      return totalBytes;
+    },
+    markFileDone(size) {
+      completedBytes += Math.max(0, size);
+    },
+    snapshot(currentFileOffset = 0) {
       const now = performance.now();
-      const deltaBytes = Math.max(0, bytes - lastBytes);
-      const deltaTime = Math.max(0.001, (now - lastAt) / 1000);
-      const sample = deltaBytes / deltaTime;
-      instant = instant > 0 ? instant * 0.7 + sample * 0.3 : sample;
-      lastAt = now;
-      lastBytes = bytes;
+      const transferred = Math.min(totalBytes, completedBytes + Math.max(0, currentFileOffset));
       const elapsed = Math.max(0.001, (now - startedAt) / 1000);
-      const average = bytes / elapsed;
-      const rate = instant > 0 ? instant : average;
-      const remaining = Math.max(0, total - bytes);
-      const etaSeconds = rate > 0 && total > 0 ? remaining / rate : NaN;
+      const remaining = Math.max(0, totalBytes - transferred);
+      // Wait until we have a meaningful sample so early spikes don't skew ETA.
+      const ready = elapsed >= 1 && transferred >= 256 * 1024;
+      const rate = ready ? transferred / elapsed : NaN;
+      const etaSeconds = ready && rate > 0 ? remaining / rate : NaN;
+      const shouldRender = now - lastUiAt >= 200 || remaining === 0;
+      if (shouldRender) lastUiAt = now;
       return {
-        instant,
-        average,
+        transferred,
+        remaining,
+        rate,
         etaSeconds,
+        shouldRender,
+        elapsed,
       };
     },
-    finish(bytes) {
+    finish() {
       const elapsed = Math.max(0.001, (performance.now() - startedAt) / 1000);
-      return bytes / elapsed;
+      return totalBytes / elapsed;
     },
   };
 }
@@ -807,11 +819,17 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-async function sendOneFile(transport, peerId, file, { batchId = null, transferId = null } = {}) {
+async function sendOneFile(
+  transport,
+  peerId,
+  file,
+  { batchId = null, transferId = null, operationMeter = null, fileIndex = 1, fileCount = 1 } = {}
+) {
   const targetName = peerName(peerId);
   const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
   const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
   const id = transferId || crypto.randomUUID();
+  const meter = operationMeter || createOperationMeter(file.size);
 
   if (!transferId) {
     createTransferItem({
@@ -834,26 +852,37 @@ async function sendOneFile(transport, peerId, file, { batchId = null, transferId
   );
 
   let offset = 0;
-  const speedMeter = createSpeedMeter();
   while (offset < file.size) {
     const chunk = file.slice(offset, offset + chunkSize);
     const buffer = await chunk.arrayBuffer();
     await transport.send(buffer);
     offset += buffer.byteLength;
-    const { instant, etaSeconds } = speedMeter.update(offset, file.size);
+    const snap = meter.snapshot(offset);
+    if (!snap.shouldRender && offset < file.size) continue;
+
+    const fileProgress =
+      fileCount > 1
+        ? `arquivo ${fileIndex}/${fileCount} · ${formatBytes(snap.transferred)} / ${formatBytes(meter.totalBytes)}`
+        : `${formatBytes(offset)} / ${formatBytes(file.size)}`;
+
     updateTransferProgress(
       id,
-      offset / file.size,
-      `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
+      fileCount > 1 ? snap.transferred / meter.totalBytes : offset / file.size,
+      `Enviando → ${targetName} · ${via} · ${fileProgress} · ${formatSpeed(snap.rate)} · ${formatEta(snap.etaSeconds)}`
     );
   }
 
   await transport.send(JSON.stringify({ kind: "done", transferId: id, batchId }));
-  const avgSpeed = speedMeter.finish(file.size);
+  meter.markFileDone(file.size);
+  const snap = meter.snapshot(0);
+  const doneProgress =
+    fileCount > 1
+      ? `arquivo ${fileIndex}/${fileCount} · ${formatBytes(snap.transferred)} / ${formatBytes(meter.totalBytes)}`
+      : formatBytes(file.size);
   updateTransferProgress(
     id,
-    1,
-    `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
+    fileCount > 1 ? snap.transferred / Math.max(1, meter.totalBytes) : 1,
+    `Enviado → ${targetName} · ${via} · ${doneProgress} · média ${formatSpeed(snap.rate)}`
   );
   return id;
 }
@@ -864,6 +893,8 @@ async function sendFilesTo(peerId, files) {
     let transport = await openTransport(peerId);
     const list = [...files];
     const batchId = list.length > 1 ? crypto.randomUUID() : null;
+    const totalBytes = list.reduce((sum, file) => sum + file.size, 0);
+    const operationMeter = createOperationMeter(totalBytes);
 
     if (batchId) {
       await transport.send(
@@ -871,11 +902,13 @@ async function sendFilesTo(peerId, files) {
           kind: "batch-start",
           batchId,
           count: list.length,
+          totalBytes,
         })
       );
     }
 
-    for (const file of list) {
+    for (let index = 0; index < list.length; index += 1) {
+      const file = list[index];
       const transferId = crypto.randomUUID();
       createTransferItem({
         id: transferId,
@@ -884,10 +917,17 @@ async function sendFilesTo(peerId, files) {
         direction: `Enviando → ${peerName(peerId)}`,
       });
 
+      const opts = {
+        batchId,
+        transferId,
+        operationMeter,
+        fileIndex: index + 1,
+        fileCount: list.length,
+      };
+
       try {
-        await sendOneFile(transport, peerId, file, { batchId, transferId });
+        await sendOneFile(transport, peerId, file, opts);
       } catch (err) {
-        // Mid-transfer P2P drops are common on mobile; continue via relay.
         closePeer(peerId);
         transport = await openTransport(peerId, { forceRelay: true });
         if (batchId) {
@@ -896,14 +936,14 @@ async function sendFilesTo(peerId, files) {
               kind: "batch-start",
               batchId,
               count: 1,
+              totalBytes: file.size,
             })
           );
         }
-        await sendOneFile(transport, peerId, file, { batchId, transferId });
+        await sendOneFile(transport, peerId, file, opts);
         if (batchId) {
           await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
         }
-        continue;
       }
     }
 
@@ -975,14 +1015,21 @@ function onChannelMessage(peerId, data) {
   if (typeof data === "string") {
     const msg = JSON.parse(data);
     if (msg.kind === "batch-start") {
+      const totalBytes = Number(msg.totalBytes) || 0;
       state.batches.set(msg.batchId, {
         peerId,
         expected: Number(msg.count) || 0,
         files: [],
+        totalBytes,
+        operationMeter: totalBytes > 0 ? createOperationMeter(totalBytes) : null,
+        filesDone: 0,
       });
       return;
     }
     if (msg.kind === "meta") {
+      const batch = msg.batchId ? state.batches.get(msg.batchId) : null;
+      const operationMeter =
+        batch?.operationMeter || createOperationMeter(Number(msg.size) || 0);
       state.incoming.set(msg.transferId, {
         peerId,
         batchId: msg.batchId || null,
@@ -991,7 +1038,9 @@ function onChannelMessage(peerId, data) {
         type: msg.type,
         received: 0,
         chunks: [],
-        speedMeter: createSpeedMeter(),
+        operationMeter,
+        fileIndex: batch ? batch.filesDone + 1 : 1,
+        fileCount: batch?.expected || 1,
       });
       beginTransferKeepAwake();
       createTransferItem({
@@ -1020,12 +1069,20 @@ function onChannelMessage(peerId, data) {
   const transferId = [...state.incoming.entries()].find(([, v]) => v === entry)?.[0];
   entry.chunks.push(data);
   entry.received += data.byteLength;
-  if (!entry.speedMeter) entry.speedMeter = createSpeedMeter();
-  const { instant, etaSeconds } = entry.speedMeter.update(entry.received, entry.size);
+  if (!entry.operationMeter) entry.operationMeter = createOperationMeter(entry.size);
+  const snap = entry.operationMeter.snapshot(entry.received);
+  if (!snap.shouldRender && entry.received < entry.size) return;
+
+  const fileCount = entry.fileCount || 1;
+  const progressLabel =
+    fileCount > 1
+      ? `arquivo ${entry.fileIndex}/${fileCount} · ${formatBytes(snap.transferred)} / ${formatBytes(entry.operationMeter.totalBytes)}`
+      : `${formatBytes(entry.received)} / ${formatBytes(entry.size)}`;
+
   updateTransferProgress(
     transferId,
-    entry.received / entry.size,
-    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
+    fileCount > 1 ? snap.transferred / Math.max(1, entry.operationMeter.totalBytes) : entry.received / entry.size,
+    `Recebendo ← ${peerName(peerId)} · ${progressLabel} · ${formatSpeed(snap.rate)} · ${formatEta(snap.etaSeconds)}`
   );
 }
 
@@ -1033,17 +1090,24 @@ function finalizeIncoming(transferId) {
   const entry = state.incoming.get(transferId);
   if (!entry) return;
   const blob = new Blob(entry.chunks, { type: entry.type || "application/octet-stream" });
-  const avgSpeed = entry.speedMeter?.finish(entry.received) || 0;
+  entry.operationMeter?.markFileDone(entry.size);
+  const snap = entry.operationMeter?.snapshot(0) || { rate: 0, transferred: entry.size };
+  const fileCount = entry.fileCount || 1;
+  const doneLabel =
+    fileCount > 1
+      ? `arquivo ${entry.fileIndex}/${fileCount} · ${formatBytes(snap.transferred)} / ${formatBytes(entry.operationMeter.totalBytes)}`
+      : formatBytes(entry.size);
   updateTransferProgress(
     transferId,
-    1,
-    `Recebido ← ${peerName(entry.peerId)} · ${formatBytes(entry.size)} · média ${formatSpeed(avgSpeed)}`
+    fileCount > 1 ? snap.transferred / Math.max(1, entry.operationMeter.totalBytes) : 1,
+    `Recebido ← ${peerName(entry.peerId)} · ${doneLabel} · média ${formatSpeed(snap.rate)}`
   );
   state.incoming.delete(transferId);
 
   if (entry.batchId && state.batches.has(entry.batchId)) {
     const batch = state.batches.get(entry.batchId);
     batch.files.push({ name: entry.name, blob });
+    batch.filesDone = (batch.filesDone || 0) + 1;
     endTransferKeepAwake();
     return;
   }
