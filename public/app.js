@@ -171,6 +171,41 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function formatSpeed(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "—";
+  if (bytesPerSecond < 1024) return `${Math.round(bytesPerSecond)} B/s`;
+  if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+function createSpeedMeter() {
+  const startedAt = performance.now();
+  let lastAt = startedAt;
+  let lastBytes = 0;
+  let instant = 0;
+
+  return {
+    update(bytes) {
+      const now = performance.now();
+      const deltaBytes = Math.max(0, bytes - lastBytes);
+      const deltaTime = Math.max(0.001, (now - lastAt) / 1000);
+      const sample = deltaBytes / deltaTime;
+      instant = instant > 0 ? instant * 0.7 + sample * 0.3 : sample;
+      lastAt = now;
+      lastBytes = bytes;
+      const elapsed = Math.max(0.001, (now - startedAt) / 1000);
+      return {
+        instant,
+        average: bytes / elapsed,
+      };
+    },
+    finish(bytes) {
+      const elapsed = Math.max(0.001, (performance.now() - startedAt) / 1000);
+      return bytes / elapsed;
+    },
+  };
+}
+
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/ws`;
@@ -608,23 +643,26 @@ async function sendFilesTo(peerId, files) {
     );
 
     let offset = 0;
+    const speedMeter = createSpeedMeter();
     while (offset < file.size) {
       const chunk = file.slice(offset, offset + chunkSize);
       const buffer = await chunk.arrayBuffer();
       await transport.send(buffer);
       offset += buffer.byteLength;
+      const { instant } = speedMeter.update(offset);
       updateTransferProgress(
         transferId,
         offset / file.size,
-        `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)}`
+        `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)}`
       );
     }
 
     await transport.send(JSON.stringify({ kind: "done", transferId, batchId }));
+    const avgSpeed = speedMeter.finish(file.size);
     updateTransferProgress(
       transferId,
       1,
-      `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)}`
+      `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
     );
   }
 
@@ -704,6 +742,7 @@ function onChannelMessage(peerId, data) {
         type: msg.type,
         received: 0,
         chunks: [],
+        speedMeter: createSpeedMeter(),
       });
       createTransferItem({
         id: msg.transferId,
@@ -731,10 +770,12 @@ function onChannelMessage(peerId, data) {
   const transferId = [...state.incoming.entries()].find(([, v]) => v === entry)?.[0];
   entry.chunks.push(data);
   entry.received += data.byteLength;
+  if (!entry.speedMeter) entry.speedMeter = createSpeedMeter();
+  const { instant } = entry.speedMeter.update(entry.received);
   updateTransferProgress(
     transferId,
     entry.received / entry.size,
-    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)}`
+    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)} · ${formatSpeed(instant)}`
   );
 }
 
@@ -742,10 +783,11 @@ function finalizeIncoming(transferId) {
   const entry = state.incoming.get(transferId);
   if (!entry) return;
   const blob = new Blob(entry.chunks, { type: entry.type || "application/octet-stream" });
+  const avgSpeed = entry.speedMeter?.finish(entry.received) || 0;
   updateTransferProgress(
     transferId,
     1,
-    `Recebido ← ${peerName(entry.peerId)} · ${formatBytes(entry.size)}`
+    `Recebido ← ${peerName(entry.peerId)} · ${formatBytes(entry.size)} · média ${formatSpeed(avgSpeed)}`
   );
   state.incoming.delete(transferId);
 
