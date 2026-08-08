@@ -11,6 +11,7 @@ const el = {
   room: document.getElementById("room"),
   createBtn: document.getElementById("createBtn"),
   joinToggleBtn: document.getElementById("joinToggleBtn"),
+  scanQrBtn: document.getElementById("scanQrBtn"),
   joinForm: document.getElementById("joinForm"),
   codeInput: document.getElementById("codeInput"),
   deviceNameInput: document.getElementById("deviceNameInput"),
@@ -26,6 +27,11 @@ const el = {
   sendBtn: document.getElementById("sendBtn"),
   transfers: document.getElementById("transfers"),
   toast: document.getElementById("toast"),
+  scanModal: document.getElementById("scanModal"),
+  scanVideo: document.getElementById("scanVideo"),
+  scanCanvas: document.getElementById("scanCanvas"),
+  scanStatus: document.getElementById("scanStatus"),
+  closeScanBtn: document.getElementById("closeScanBtn"),
 };
 
 const DEVICE_NAME_KEY = "filelink-device-name";
@@ -39,6 +45,13 @@ const state = {
   selectedFiles: [],
   connections: new Map(),
   incoming: new Map(),
+  batches: new Map(),
+  scan: {
+    stream: null,
+    raf: 0,
+    detector: null,
+    running: false,
+  },
 };
 
 let toastTimer = null;
@@ -233,6 +246,7 @@ function leaveRoomUI() {
   state.peerId = null;
   state.peers = [];
   state.selectedFiles = [];
+  state.batches.clear();
   el.fileInput.value = "";
   if (el.roomQr) {
     el.roomQr.removeAttribute("src");
@@ -553,8 +567,20 @@ async function sendFilesTo(peerId, files) {
   const targetName = peerName(peerId);
   const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
   const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
+  const list = [...files];
+  const batchId = list.length > 1 ? crypto.randomUUID() : null;
 
-  for (const file of files) {
+  if (batchId) {
+    await transport.send(
+      JSON.stringify({
+        kind: "batch-start",
+        batchId,
+        count: list.length,
+      })
+    );
+  }
+
+  for (const file of list) {
     const transferId = crypto.randomUUID();
     createTransferItem({
       id: transferId,
@@ -567,6 +593,7 @@ async function sendFilesTo(peerId, files) {
       JSON.stringify({
         kind: "meta",
         transferId,
+        batchId,
         name: file.name,
         size: file.size,
         type: file.type || "application/octet-stream",
@@ -586,21 +613,85 @@ async function sendFilesTo(peerId, files) {
       );
     }
 
-    await transport.send(JSON.stringify({ kind: "done", transferId }));
+    await transport.send(JSON.stringify({ kind: "done", transferId, batchId }));
     updateTransferProgress(
       transferId,
       1,
       `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)}`
     );
   }
+
+  if (batchId) {
+    await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function uniqueZipName(name, used) {
+  if (!used.has(name)) {
+    used.add(name);
+    return name;
+  }
+  const match = name.match(/^(.*?)(\.[^.]+)?$/);
+  const base = match?.[1] || name;
+  const ext = match?.[2] || "";
+  let i = 1;
+  let candidate = `${base} (${i})${ext}`;
+  while (used.has(candidate)) {
+    i += 1;
+    candidate = `${base} (${i})${ext}`;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+async function downloadFilesTogether(files) {
+  if (files.length === 0) return;
+  if (files.length === 1) {
+    downloadBlob(files[0].blob, files[0].name);
+    showToast(`Arquivo recebido: ${files[0].name}`);
+    return;
+  }
+
+  if (typeof JSZip === "undefined") {
+    for (const file of files) downloadBlob(file.blob, file.name);
+    showToast(`${files.length} arquivos recebidos`);
+    return;
+  }
+
+  const zip = new JSZip();
+  const used = new Set();
+  for (const file of files) {
+    zip.file(uniqueZipName(file.name, used), file.blob);
+  }
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob(blob, `FileLink-${files.length}-arquivos.zip`);
+  showToast(`${files.length} arquivos baixados juntos`);
 }
 
 function onChannelMessage(peerId, data) {
   if (typeof data === "string") {
     const msg = JSON.parse(data);
+    if (msg.kind === "batch-start") {
+      state.batches.set(msg.batchId, {
+        peerId,
+        expected: Number(msg.count) || 0,
+        files: [],
+      });
+      return;
+    }
     if (msg.kind === "meta") {
       state.incoming.set(msg.transferId, {
         peerId,
+        batchId: msg.batchId || null,
         name: msg.name,
         size: msg.size,
         type: msg.type,
@@ -617,12 +708,14 @@ function onChannelMessage(peerId, data) {
     }
     if (msg.kind === "done") {
       finalizeIncoming(msg.transferId);
+      return;
+    }
+    if (msg.kind === "batch-end") {
+      flushBatch(msg.batchId);
     }
     return;
   }
 
-  // binary chunk: attach to latest open incoming from this peer if only one,
-  // otherwise match by scanning for incomplete transfers from peer
   const entry = [...state.incoming.values()].find(
     (item) => item.peerId === peerId && item.received < item.size
   );
@@ -641,20 +734,142 @@ function onChannelMessage(peerId, data) {
 function finalizeIncoming(transferId) {
   const entry = state.incoming.get(transferId);
   if (!entry) return;
-  const blob = new Blob(entry.chunks, { type: entry.type });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = entry.name;
-  a.click();
-  URL.revokeObjectURL(url);
+  const blob = new Blob(entry.chunks, { type: entry.type || "application/octet-stream" });
   updateTransferProgress(
     transferId,
     1,
     `Recebido ← ${peerName(entry.peerId)} · ${formatBytes(entry.size)}`
   );
   state.incoming.delete(transferId);
+
+  if (entry.batchId && state.batches.has(entry.batchId)) {
+    const batch = state.batches.get(entry.batchId);
+    batch.files.push({ name: entry.name, blob });
+    return;
+  }
+
+  downloadBlob(blob, entry.name);
   showToast(`Arquivo recebido: ${entry.name}`);
+}
+
+async function flushBatch(batchId) {
+  const batch = state.batches.get(batchId);
+  if (!batch) return;
+  state.batches.delete(batchId);
+  await downloadFilesTogether(batch.files);
+}
+
+function extractRoomCode(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  try {
+    const url = new URL(text);
+    const code = url.searchParams.get("code");
+    if (code) return code.toUpperCase();
+  } catch {
+    // not a URL
+  }
+  const match = text.toUpperCase().match(/\b([A-Z0-9]{6})\b/);
+  return match ? match[1] : null;
+}
+
+function stopQrScanner() {
+  state.scan.running = false;
+  if (state.scan.raf) {
+    cancelAnimationFrame(state.scan.raf);
+    state.scan.raf = 0;
+  }
+  if (state.scan.stream) {
+    for (const track of state.scan.stream.getTracks()) track.stop();
+    state.scan.stream = null;
+  }
+  if (el.scanVideo) el.scanVideo.srcObject = null;
+  el.scanModal?.classList.add("hidden");
+}
+
+async function handleScannedPayload(raw) {
+  const code = extractRoomCode(raw);
+  if (!code) return false;
+  stopQrScanner();
+  el.joinForm.classList.remove("hidden");
+  el.codeInput.value = code;
+  showToast(`QR lido: ${code}`);
+  joinRoom(code);
+  return true;
+}
+
+async function scanLoop() {
+  if (!state.scan.running) return;
+  const video = el.scanVideo;
+  if (video.readyState >= 2) {
+    if (state.scan.detector) {
+      try {
+        const codes = await state.scan.detector.detect(video);
+        if (codes?.[0]?.rawValue && (await handleScannedPayload(codes[0].rawValue))) return;
+      } catch {
+        // keep scanning
+      }
+    } else if (typeof jsQR !== "undefined") {
+      const canvas = el.scanCanvas;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const result = jsQR(image.data, image.width, image.height, {
+        inversionAttempts: "dontInvert",
+      });
+      if (result?.data && (await handleScannedPayload(result.data))) return;
+    }
+  }
+  state.scan.raf = requestAnimationFrame(scanLoop);
+}
+
+async function startQrScanner() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showToast("Câmera indisponível neste navegador");
+    return;
+  }
+
+  stopQrScanner();
+  el.scanModal.classList.remove("hidden");
+  el.scanStatus.textContent = "Abrindo câmera…";
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+    });
+    state.scan.stream = stream;
+    el.scanVideo.srcObject = stream;
+    await el.scanVideo.play();
+
+    if ("BarcodeDetector" in window) {
+      try {
+        state.scan.detector = new BarcodeDetector({ formats: ["qr_code"] });
+      } catch {
+        state.scan.detector = null;
+      }
+    } else {
+      state.scan.detector = null;
+    }
+
+    if (!state.scan.detector && typeof jsQR === "undefined") {
+      el.scanStatus.textContent = "Leitor de QR indisponível";
+      return;
+    }
+
+    el.scanStatus.textContent = "Aponte para o QR da rede…";
+    state.scan.running = true;
+    state.scan.raf = requestAnimationFrame(scanLoop);
+  } catch {
+    el.scanStatus.textContent = "Permissão da câmera negada ou indisponível";
+    showToast("Não foi possível abrir a câmera");
+  }
 }
 
 function createRoom() {
@@ -688,6 +903,13 @@ el.createBtn.addEventListener("click", createRoom);
 el.joinToggleBtn.addEventListener("click", () => {
   el.joinForm.classList.toggle("hidden");
   if (!el.joinForm.classList.contains("hidden")) el.codeInput.focus();
+});
+el.scanQrBtn?.addEventListener("click", () => {
+  startQrScanner();
+});
+el.closeScanBtn?.addEventListener("click", () => stopQrScanner());
+el.scanModal?.addEventListener("click", (event) => {
+  if (event.target === el.scanModal) stopQrScanner();
 });
 
 el.joinForm.addEventListener("submit", (event) => {
