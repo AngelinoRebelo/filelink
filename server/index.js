@@ -329,7 +329,7 @@ wss.on("connection", (ws) => {
       if (!payload || typeof payload !== "object") {
         return send(ws, "error", { message: "Pacote de relay inválido." });
       }
-      if (payload.kind === "bin" && typeof payload.b64 === "string" && payload.b64.length > 120000) {
+      if (payload.kind === "bin" && typeof payload.b64 === "string" && payload.b64.length > 200000) {
         return send(ws, "error", { message: "Bloco de arquivo grande demais." });
       }
 

@@ -1,8 +1,12 @@
-const CHUNK_SIZE = 64 * 1024;
-const RELAY_CHUNK_SIZE = 12 * 1024;
+const CHUNK_SIZE = 256 * 1024; // 256 KB — larger P2P blocks fill the pipe faster
+const RELAY_CHUNK_SIZE = 48 * 1024; // bigger relay blocks (still under WS payload limit)
+const P2P_HIGH_WATER = 16 * 1024 * 1024; // keep up to 16 MB queued in the data channel
+const P2P_LOW_WATER = 2 * 1024 * 1024; // resume when buffer drains to 2 MB
+const RELAY_HIGH_WATER = 2 * 1024 * 1024;
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
 ];
 
 const el = {
@@ -609,8 +613,11 @@ async function ensureConnection(peerId, initiator) {
 
   if (conn) closePeer(peerId);
 
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  conn = { pc, channel: null, mode: "webrtc" };
+  const pc = new RTCPeerConnection({
+    iceServers: ICE_SERVERS,
+    bundlePolicy: "max-bundle",
+  });
+  conn = { pc, channel: null, mode: "webrtc", failed: false };
   state.connections.set(peerId, conn);
 
   pc.onicecandidate = (event) => {
@@ -620,7 +627,10 @@ async function ensureConnection(peerId, initiator) {
   };
 
   if (initiator) {
-    const channel = pc.createDataChannel("filelink", { ordered: true });
+    const channel = pc.createDataChannel("filelink", {
+      ordered: true,
+      negotiated: false,
+    });
     wireChannel(peerId, channel);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -636,7 +646,9 @@ function wireChannel(peerId, channel) {
   const conn = state.connections.get(peerId);
   if (!conn) return;
   conn.channel = channel;
+  conn.failed = false;
   channel.binaryType = "arraybuffer";
+  channel.bufferedAmountLowThreshold = P2P_LOW_WATER;
   channel.onmessage = (event) => onChannelMessage(peerId, event.data);
   channel.onerror = () => {
     conn.failed = true;
@@ -644,6 +656,33 @@ function wireChannel(peerId, channel) {
   channel.onclose = () => {
     conn.failed = true;
   };
+}
+
+function waitForChannelDrain(channel) {
+  if (!channel || channel.readyState !== "open") {
+    return Promise.reject(new Error("Canal P2P fechou"));
+  }
+  if (channel.bufferedAmount <= P2P_LOW_WATER) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      channel.removeEventListener("bufferedamountlow", onLow);
+      channel.removeEventListener("close", onClose);
+      channel.removeEventListener("error", onClose);
+      fn(value);
+    };
+    const onLow = () => done(resolve);
+    const onClose = () => done(reject, new Error("Canal P2P fechou"));
+    const timer = setTimeout(() => done(resolve), 3000);
+    channel.bufferedAmountLowThreshold = P2P_LOW_WATER;
+    channel.addEventListener("bufferedamountlow", onLow);
+    channel.addEventListener("close", onClose);
+    channel.addEventListener("error", onClose);
+  });
 }
 
 async function handlePeerSignal(from, data) {
@@ -758,7 +797,13 @@ function createRelayTransport(peerId) {
         throw new Error("Sinalização offline");
       }
       relaySend(peerId, payload);
-      await new Promise((r) => setTimeout(r, 8));
+      // Only yield when the browser socket buffer is actually backing up.
+      while (state.ws.bufferedAmount > RELAY_HIGH_WATER) {
+        await new Promise((r) => setTimeout(r, 1));
+        if (state.ws.readyState !== WebSocket.OPEN) {
+          throw new Error("Sinalização offline");
+        }
+      }
     },
   };
 }
@@ -774,8 +819,11 @@ async function openTransport(peerId, { forceRelay = false } = {}) {
           if (!conn.channel || conn.channel.readyState !== "open" || conn.failed) {
             throw new Error("Canal P2P fechou");
           }
-          while (conn.channel.bufferedAmount > 8 * 1024 * 1024) {
-            await new Promise((r) => setTimeout(r, 20));
+          if (conn.channel.bufferedAmount > P2P_HIGH_WATER) {
+            await waitForChannelDrain(conn.channel);
+          }
+          if (!conn.channel || conn.channel.readyState !== "open" || conn.failed) {
+            throw new Error("Canal P2P fechou");
           }
           conn.channel.send(payload);
         },
@@ -852,11 +900,17 @@ async function sendOneFile(
   );
 
   let offset = 0;
-  while (offset < file.size) {
-    const chunk = file.slice(offset, offset + chunkSize);
-    const buffer = await chunk.arrayBuffer();
-    await transport.send(buffer);
+  let nextRead =
+    offset < file.size ? file.slice(offset, offset + chunkSize).arrayBuffer() : null;
+
+  while (offset < file.size && nextRead) {
+    const buffer = await nextRead;
     offset += buffer.byteLength;
+    // Prefetch the next chunk while this one is in flight.
+    nextRead =
+      offset < file.size ? file.slice(offset, offset + chunkSize).arrayBuffer() : null;
+
+    await transport.send(buffer);
     const snap = meter.snapshot(offset);
     if (!snap.shouldRender && offset < file.size) continue;
 
