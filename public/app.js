@@ -1,5 +1,9 @@
 const CHUNK_SIZE = 64 * 1024;
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+const RELAY_CHUNK_SIZE = 12 * 1024;
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
 
 const el = {
   status: document.getElementById("connectionStatus"),
@@ -275,6 +279,9 @@ function handleSignalMessage(msg) {
     case "signal":
       handlePeerSignal(msg.from, msg.data);
       break;
+    case "relay":
+      handleRelayMessage(msg.from, msg.data);
+      break;
     case "error":
       showToast(msg.message || "Erro");
       break;
@@ -350,7 +357,7 @@ async function ensureConnection(peerId, initiator) {
   if (conn) closePeer(peerId);
 
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  conn = { pc, channel: null, makingOffer: false };
+  conn = { pc, channel: null, mode: "webrtc" };
   state.connections.set(peerId, conn);
 
   pc.onicecandidate = (event) => {
@@ -359,20 +366,12 @@ async function ensureConnection(peerId, initiator) {
     }
   };
 
-  pc.onconnectionstatechange = () => {
-    if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
-      // keep map entry briefly; next send recreates
-    }
-  };
-
   if (initiator) {
     const channel = pc.createDataChannel("filelink", { ordered: true });
     wireChannel(peerId, channel);
-    conn.makingOffer = true;
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     send("signal", { to: peerId, data: { type: "offer", sdp: pc.localDescription } });
-    conn.makingOffer = false;
   } else {
     pc.ondatachannel = (event) => wireChannel(peerId, event.channel);
   }
@@ -387,12 +386,6 @@ function wireChannel(peerId, channel) {
   channel.binaryType = "arraybuffer";
 
   channel.onmessage = (event) => onChannelMessage(peerId, event.data);
-  channel.onopen = () => {
-    // ready
-  };
-  channel.onclose = () => {
-    // ignore
-  };
 }
 
 async function handlePeerSignal(from, data) {
@@ -424,19 +417,105 @@ async function handlePeerSignal(from, data) {
   }
 }
 
-function waitForOpen(channel) {
-  if (channel.readyState === "open") return Promise.resolve();
+function waitForOpen(channel, pc, timeoutMs = 8000) {
+  if (channel?.readyState === "open") return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Canal demorou para abrir")), 12000);
-    channel.addEventListener(
-      "open",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true }
-    );
+    const fail = (reason) => {
+      cleanup();
+      reject(new Error(reason));
+    };
+    const timer = setTimeout(() => fail("Canal demorou para abrir"), timeoutMs);
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => fail("Canal fechou antes de abrir");
+    const onState = () => {
+      if (pc && ["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+        fail("Conexão P2P indisponível");
+      }
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      channel?.removeEventListener("open", onOpen);
+      channel?.removeEventListener("close", onClose);
+      pc?.removeEventListener("connectionstatechange", onState);
+    };
+
+    if (!channel) {
+      fail("Canal indisponível");
+      return;
+    }
+
+    channel.addEventListener("open", onOpen);
+    channel.addEventListener("close", onClose);
+    pc?.addEventListener("connectionstatechange", onState);
   });
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function handleRelayMessage(from, data) {
+  if (!data || typeof data !== "object") return;
+  if (data.kind === "text" && typeof data.text === "string") {
+    onChannelMessage(from, data.text);
+    return;
+  }
+  if (data.kind === "bin" && typeof data.b64 === "string") {
+    onChannelMessage(from, base64ToArrayBuffer(data.b64));
+  }
+}
+
+function relaySend(peerId, payload) {
+  if (typeof payload === "string") {
+    send("relay", { to: peerId, data: { kind: "text", text: payload } });
+    return;
+  }
+  send("relay", {
+    to: peerId,
+    data: { kind: "bin", b64: arrayBufferToBase64(payload) },
+  });
+}
+
+async function openTransport(peerId) {
+  try {
+    const conn = await ensureConnection(peerId, true);
+    await waitForOpen(conn.channel, conn.pc, 8000);
+    return {
+      mode: "p2p",
+      async send(payload) {
+        while (conn.channel.bufferedAmount > 8 * 1024 * 1024) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        conn.channel.send(payload);
+      },
+    };
+  } catch {
+    closePeer(peerId);
+    showToast("Usando rede FileLink (sem Wi‑Fi compartilhado)");
+    return {
+      mode: "relay",
+      async send(payload) {
+        relaySend(peerId, payload);
+        await new Promise((r) => setTimeout(r, 8));
+      },
+    };
+  }
 }
 
 function createTransferItem({ id, name, size, direction }) {
@@ -470,9 +549,10 @@ function escapeHtml(value) {
 }
 
 async function sendFilesTo(peerId, files) {
-  const conn = await ensureConnection(peerId, true);
-  await waitForOpen(conn.channel);
+  const transport = await openTransport(peerId);
   const targetName = peerName(peerId);
+  const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
+  const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
 
   for (const file of files) {
     const transferId = crypto.randomUUID();
@@ -483,7 +563,7 @@ async function sendFilesTo(peerId, files) {
       direction: `Enviando → ${targetName}`,
     });
 
-    conn.channel.send(
+    await transport.send(
       JSON.stringify({
         kind: "meta",
         transferId,
@@ -495,23 +575,23 @@ async function sendFilesTo(peerId, files) {
 
     let offset = 0;
     while (offset < file.size) {
-      const chunk = file.slice(offset, offset + CHUNK_SIZE);
+      const chunk = file.slice(offset, offset + chunkSize);
       const buffer = await chunk.arrayBuffer();
-      // backpressure
-      while (conn.channel.bufferedAmount > 8 * 1024 * 1024) {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      conn.channel.send(buffer);
+      await transport.send(buffer);
       offset += buffer.byteLength;
       updateTransferProgress(
         transferId,
         offset / file.size,
-        `Enviando → ${targetName} · ${formatBytes(offset)} / ${formatBytes(file.size)}`
+        `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)}`
       );
     }
 
-    conn.channel.send(JSON.stringify({ kind: "done", transferId }));
-    updateTransferProgress(transferId, 1, `Enviado → ${targetName} · ${formatBytes(file.size)}`);
+    await transport.send(JSON.stringify({ kind: "done", transferId }));
+    updateTransferProgress(
+      transferId,
+      1,
+      `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)}`
+    );
   }
 }
 

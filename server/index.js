@@ -203,6 +203,30 @@ wss.on("connection", (ws) => {
       });
     }
 
+    if (type === "relay") {
+      const room = getRoom(ws.roomCode);
+      if (!room || !ws.peerId) {
+        return send(ws, "error", { message: "Entre em uma rede antes de enviar." });
+      }
+      const target = room.peers.get(msg.to);
+      if (!target) {
+        return send(ws, "error", { message: "Dispositivo destino offline." });
+      }
+
+      const payload = msg.data;
+      if (!payload || typeof payload !== "object") {
+        return send(ws, "error", { message: "Pacote de relay inválido." });
+      }
+      if (payload.kind === "bin" && typeof payload.b64 === "string" && payload.b64.length > 120000) {
+        return send(ws, "error", { message: "Bloco de arquivo grande demais." });
+      }
+
+      return send(target, "relay", {
+        from: ws.peerId,
+        data: payload,
+      });
+    }
+
     if (type === "ping") {
       return send(ws, "pong");
     }

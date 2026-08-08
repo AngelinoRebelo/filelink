@@ -1,8 +1,11 @@
 # FileLink
 
-Ferramenta web para criar uma **rede temporária** e transferir arquivos entre aparelhos (PC, celular, tablet) na mesma sessão — direto de um dispositivo para o outro via WebRTC.
+Ferramenta web para criar uma **rede temporária FileLink** e transferir arquivos entre aparelhos (PC, celular, tablet).
 
-O servidor só faz sinalização (WebSocket). Os arquivos **não passam pela nuvem**.
+Não é necessário estar no mesmo Wi‑Fi: funciona com **dados móveis (4G/5G)** ou redes diferentes. A “rede” é a sessão criada pelo app (código + QR).
+
+- Preferência: envio direto **P2P (WebRTC)**
+- Se o P2P não fechar (comum fora do Wi‑Fi), usa **relay pela rede FileLink** automaticamente
 
 ## Como usar
 
@@ -12,10 +15,16 @@ O servidor só faz sinalização (WebSocket). Os arquivos **não passam pela nuv
 4. No outro aparelho, escaneie o QR ou entre com o código.
 5. Escolha os arquivos e envie para o aparelho desejado.
 
+### Sem Wi‑Fi / sem internet nenhuma
+
+1. Num aparelho, ative o **ponto de acesso (hotspot)**.
+2. No outro, conecte a essa rede Wi‑Fi criada pelo aparelho.
+3. Abra o FileLink nos dois e entre na mesma sessão (código/QR).
+
 ## Stack
 
-- Frontend: HTML, CSS, JavaScript (WebRTC DataChannel)
-- Backend: Node.js + Express + `ws` (sinalização)
+- Frontend: HTML, CSS, JavaScript (WebRTC DataChannel + relay)
+- Backend: Node.js + Express + `ws` (sinalização e relay)
 - Deploy: Railway
 
 ## Rodar local
@@ -41,8 +50,8 @@ Depois do deploy, use o domínio público do Railway nos dois aparelhos (mesma U
 
 - Funciona melhor em HTTPS (necessário para WebRTC em produção).
 - Máximo de 8 aparelhos por rede.
-- Redes expiram em 2 horas de inatividade estrutural (TTL do servidor).
-- Usa STUN público do Google; em redes corporativas muito restritas pode ser necessário TURN.
+- Redes expiram em 2 horas (TTL do servidor).
+- Sem Wi‑Fi compartilhado, o app tenta P2P e, se falhar, envia pela rede FileLink (relay).
 
 ## Licença
 

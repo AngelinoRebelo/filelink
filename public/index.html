@@ -28,7 +28,7 @@
     <main>
       <section class="hero" id="lobby">
         <h1 class="logo">FileLink</h1>
-        <p class="tagline">Crie uma rede temporária e envie arquivos direto entre aparelhos na mesma sessão.</p>
+        <p class="tagline">Crie uma rede FileLink e envie arquivos entre aparelhos — sem precisar do mesmo Wi‑Fi.</p>
 
         <label class="device-name-field" for="deviceNameInput">
           Nome deste aparelho
@@ -63,7 +63,19 @@
           </div>
         </form>
 
-        <p class="hint">Os arquivos passam de aparelho para aparelho. O servidor só conecta a sessão.</p>
+        <p class="hint">
+          Funciona com dados móveis (4G/5G) ou Wi‑Fi diferentes. A “rede” é criada pelo FileLink; os aparelhos só precisam abrir este site.
+        </p>
+
+        <details class="offline-help">
+          <summary>Sem Wi‑Fi / sem internet?</summary>
+          <p>
+            <strong>Com dados móveis:</strong> clique em <em>Criar rede</em> — a rede FileLink já conecta os aparelhos sem Wi‑Fi compartilhado.
+          </p>
+          <p>
+            <strong>Sem internet nenhuma:</strong> num aparelho ative o <em>ponto de acesso (hotspot)</em>, conecte o outro nessa rede Wi‑Fi criada por ele e abra o FileLink nos dois com o mesmo código/QR. Se o site estiver fora do ar, rode o FileLink localmente no host (`npm start`) e acesse pelo IP da rede do hotspot.
+          </p>
+        </details>
       </section>
 
       <section class="room hidden" id="room">
@@ -84,7 +96,9 @@
           </div>
         </div>
 
-        <p class="room-help">Escaneie o QR no outro aparelho ou entre com o mesmo código.</p>
+        <p class="room-help">
+          Escaneie o QR ou use o código. Não precisa do mesmo Wi‑Fi — dados móveis também entram nesta rede FileLink.
+        </p>
 
         <div class="peers" id="peers"></div>
 
