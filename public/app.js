@@ -187,6 +187,20 @@ function formatSpeed(bytesPerSecond) {
   return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
 }
 
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "calculando…";
+  if (seconds < 1) return "< 1s";
+  if (seconds < 60) return `${Math.ceil(seconds)}s restantes`;
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.ceil(seconds % 60);
+  if (mins < 60) {
+    return secs > 0 ? `${mins}m ${secs}s restantes` : `${mins}m restantes`;
+  }
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hours}h ${remMins}m restantes` : `${hours}h restantes`;
+}
+
 function createSpeedMeter() {
   const startedAt = performance.now();
   let lastAt = startedAt;
@@ -194,7 +208,7 @@ function createSpeedMeter() {
   let instant = 0;
 
   return {
-    update(bytes) {
+    update(bytes, total = 0) {
       const now = performance.now();
       const deltaBytes = Math.max(0, bytes - lastBytes);
       const deltaTime = Math.max(0.001, (now - lastAt) / 1000);
@@ -203,9 +217,14 @@ function createSpeedMeter() {
       lastAt = now;
       lastBytes = bytes;
       const elapsed = Math.max(0.001, (now - startedAt) / 1000);
+      const average = bytes / elapsed;
+      const rate = instant > 0 ? instant : average;
+      const remaining = Math.max(0, total - bytes);
+      const etaSeconds = rate > 0 && total > 0 ? remaining / rate : NaN;
       return {
         instant,
-        average: bytes / elapsed,
+        average,
+        etaSeconds,
       };
     },
     finish(bytes) {
@@ -783,11 +802,11 @@ async function sendFilesTo(peerId, files) {
         const buffer = await chunk.arrayBuffer();
         await transport.send(buffer);
         offset += buffer.byteLength;
-        const { instant } = speedMeter.update(offset);
+        const { instant, etaSeconds } = speedMeter.update(offset, file.size);
         updateTransferProgress(
           transferId,
           offset / file.size,
-          `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)}`
+          `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
         );
       }
 
@@ -909,11 +928,11 @@ function onChannelMessage(peerId, data) {
   entry.chunks.push(data);
   entry.received += data.byteLength;
   if (!entry.speedMeter) entry.speedMeter = createSpeedMeter();
-  const { instant } = entry.speedMeter.update(entry.received);
+  const { instant, etaSeconds } = entry.speedMeter.update(entry.received, entry.size);
   updateTransferProgress(
     transferId,
     entry.received / entry.size,
-    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)} · ${formatSpeed(instant)}`
+    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
   );
 }
 
