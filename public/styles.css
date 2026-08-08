@@ -115,6 +115,29 @@ main {
   font-size: clamp(1.05rem, 2.4vw, 1.25rem);
 }
 
+.device-name-field {
+  display: grid;
+  gap: 0.4rem;
+  max-width: 22rem;
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.device-name-field input {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--ink);
+  padding: 0.85rem 1.1rem;
+  font: inherit;
+}
+
+.device-name-field input:focus {
+  outline: 2px solid rgba(61, 214, 165, 0.45);
+  outline-offset: 1px;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;

@@ -30,6 +30,18 @@
         <h1 class="logo">FileLink</h1>
         <p class="tagline">Crie uma rede temporária e envie arquivos direto entre aparelhos na mesma sessão.</p>
 
+        <label class="device-name-field" for="deviceNameInput">
+          Nome deste aparelho
+          <input
+            id="deviceNameInput"
+            name="deviceName"
+            maxlength="40"
+            autocomplete="nickname"
+            spellcheck="false"
+            placeholder="Detectando…"
+          />
+        </label>
+
         <div class="actions">
           <button type="button" class="btn btn-primary" id="createBtn">Criar rede</button>
           <button type="button" class="btn btn-ghost" id="joinToggleBtn">Entrar com código</button>

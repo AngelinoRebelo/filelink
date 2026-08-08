@@ -73,8 +73,22 @@ function getRoom(code) {
   return rooms.get(String(code).toUpperCase()) || null;
 }
 
+function sanitizeDeviceName(name) {
+  const cleaned = String(name || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 40);
+  return cleaned || "Aparelho";
+}
+
 function peerList(room, excludeId = null) {
-  return [...room.peers.keys()].filter((id) => id !== excludeId);
+  return [...room.peers.entries()]
+    .filter(([id]) => id !== excludeId)
+    .map(([id, peer]) => ({
+      id,
+      name: peer.deviceName || "Aparelho",
+    }));
 }
 
 function send(ws, type, payload = {}) {
@@ -106,12 +120,14 @@ function leaveRoom(ws) {
 
   ws.roomCode = null;
   ws.peerId = null;
+  ws.deviceName = null;
 }
 
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.roomCode = null;
   ws.peerId = null;
+  ws.deviceName = null;
 
   ws.on("pong", () => {
     ws.isAlive = true;
@@ -131,12 +147,15 @@ wss.on("connection", (ws) => {
       leaveRoom(ws);
       const room = createRoom();
       const peerId = crypto.randomUUID();
+      const deviceName = sanitizeDeviceName(msg.name);
       ws.roomCode = room.code;
       ws.peerId = peerId;
+      ws.deviceName = deviceName;
       room.peers.set(peerId, ws);
       return send(ws, "room-created", {
         code: room.code,
         peerId,
+        name: deviceName,
         peers: [],
       });
     }
@@ -152,16 +171,19 @@ wss.on("connection", (ws) => {
 
       leaveRoom(ws);
       const peerId = crypto.randomUUID();
+      const deviceName = sanitizeDeviceName(msg.name);
       ws.roomCode = room.code;
       ws.peerId = peerId;
+      ws.deviceName = deviceName;
       room.peers.set(peerId, ws);
 
       send(ws, "room-joined", {
         code: room.code,
         peerId,
+        name: deviceName,
         peers: peerList(room, peerId),
       });
-      broadcast(room, "peer-joined", { peerId }, peerId);
+      broadcast(room, "peer-joined", { peerId, name: deviceName }, peerId);
       broadcast(room, "peers", { peers: peerList(room) });
       return;
     }

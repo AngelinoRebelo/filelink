@@ -9,6 +9,7 @@ const el = {
   joinToggleBtn: document.getElementById("joinToggleBtn"),
   joinForm: document.getElementById("joinForm"),
   codeInput: document.getElementById("codeInput"),
+  deviceNameInput: document.getElementById("deviceNameInput"),
   roomCode: document.getElementById("roomCode"),
   roomQr: document.getElementById("roomQr"),
   copyBtn: document.getElementById("copyBtn"),
@@ -23,9 +24,12 @@ const el = {
   toast: document.getElementById("toast"),
 };
 
+const DEVICE_NAME_KEY = "filelink-device-name";
+
 const state = {
   ws: null,
   peerId: null,
+  deviceName: "",
   roomCode: null,
   peers: [],
   selectedFiles: [],
@@ -46,8 +50,95 @@ function setStatus(text) {
   el.status.textContent = text;
 }
 
-function shortId(id) {
-  return id ? id.slice(0, 4).toUpperCase() : "????";
+function sanitizeDeviceName(name) {
+  return String(name || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 40);
+}
+
+function initials(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) return "??";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
+
+function peerName(peerId) {
+  if (peerId === state.peerId) return state.deviceName || "Você";
+  const peer = state.peers.find((item) => item.id === peerId);
+  return peer?.name || "Aparelho";
+}
+
+function normalizePeers(peers) {
+  if (!Array.isArray(peers)) return [];
+  return peers
+    .map((peer) => {
+      if (typeof peer === "string") return { id: peer, name: "Aparelho" };
+      return {
+        id: peer.id,
+        name: sanitizeDeviceName(peer.name) || "Aparelho",
+      };
+    })
+    .filter((peer) => peer.id && peer.id !== state.peerId);
+}
+
+function guessFromUserAgent() {
+  const ua = navigator.userAgent || "";
+  if (/iPhone/i.test(ua)) return "iPhone";
+  if (/iPad/i.test(ua)) return "iPad";
+  if (/Android/i.test(ua)) {
+    const model = ua.match(/Android[^;]*;\s*([^)]+)\)/i)?.[1]?.trim();
+    if (model && !/wv|Build|Linux/i.test(model)) {
+      return model.replace(/\/.*$/, "").trim().slice(0, 40) || "Android";
+    }
+    return "Android";
+  }
+  if (/Macintosh|Mac OS X/i.test(ua)) return "Mac";
+  if (/Windows NT/i.test(ua)) return "Windows";
+  if (/CrOS/i.test(ua)) return "Chromebook";
+  if (/Linux/i.test(ua)) return "Linux";
+  return "Aparelho";
+}
+
+async function detectDeviceName() {
+  const saved = sanitizeDeviceName(localStorage.getItem(DEVICE_NAME_KEY) || "");
+  if (saved) return saved;
+
+  try {
+    if (navigator.userAgentData?.getHighEntropyValues) {
+      const info = await navigator.userAgentData.getHighEntropyValues([
+        "model",
+        "platform",
+        "fullVersionList",
+      ]);
+      const model = sanitizeDeviceName(info.model || "");
+      if (model) return model;
+      const platform = sanitizeDeviceName(info.platform || "");
+      if (platform) return platform;
+    }
+  } catch {
+    // ignore and fall back to UA parsing
+  }
+
+  return guessFromUserAgent();
+}
+
+function currentDeviceName() {
+  const typed = sanitizeDeviceName(el.deviceNameInput?.value || "");
+  return typed || state.deviceName || "Aparelho";
+}
+
+function persistDeviceName(name) {
+  const cleaned = sanitizeDeviceName(name) || "Aparelho";
+  state.deviceName = cleaned;
+  if (el.deviceNameInput) el.deviceNameInput.value = cleaned;
+  localStorage.setItem(DEVICE_NAME_KEY, cleaned);
+  return cleaned;
 }
 
 function formatBytes(bytes) {
@@ -116,10 +207,11 @@ function renderRoomQr(code) {
   el.roomQr.alt = `QR code para entrar na rede ${code}`;
 }
 
-function enterRoom(code, peerId, peers) {
+function enterRoom(code, peerId, peers, name) {
   state.roomCode = code;
   state.peerId = peerId;
-  state.peers = peers || [];
+  if (name) persistDeviceName(name);
+  state.peers = normalizePeers(peers);
   el.roomCode.textContent = code;
   el.lobby.classList.add("hidden");
   el.room.classList.remove("hidden");
@@ -153,27 +245,33 @@ function handleSignalMessage(msg) {
   switch (msg.type) {
     case "room-created":
     case "room-joined":
-      enterRoom(msg.code, msg.peerId, msg.peers);
+      enterRoom(msg.code, msg.peerId, msg.peers, msg.name);
       showToast(msg.type === "room-created" ? "Rede criada" : "Você entrou na rede");
       break;
     case "peers":
-      state.peers = msg.peers || [];
+      state.peers = normalizePeers(msg.peers);
       renderPeers();
       updateTargetSelect();
       break;
-    case "peer-joined":
-      if (!state.peers.includes(msg.peerId)) state.peers.push(msg.peerId);
+    case "peer-joined": {
+      const name = sanitizeDeviceName(msg.name) || "Aparelho";
+      if (!state.peers.some((peer) => peer.id === msg.peerId)) {
+        state.peers.push({ id: msg.peerId, name });
+      }
       renderPeers();
       updateTargetSelect();
-      showToast(`Aparelho ${shortId(msg.peerId)} entrou`);
+      showToast(`${name} entrou`);
       break;
-    case "peer-left":
-      state.peers = state.peers.filter((id) => id !== msg.peerId);
+    }
+    case "peer-left": {
+      const leftName = peerName(msg.peerId);
+      state.peers = state.peers.filter((peer) => peer.id !== msg.peerId);
       closePeer(msg.peerId);
       renderPeers();
       updateTargetSelect();
-      showToast(`Aparelho ${shortId(msg.peerId)} saiu`);
+      showToast(`${leftName} saiu`);
       break;
+    }
     case "signal":
       handlePeerSignal(msg.from, msg.data);
       break;
@@ -187,20 +285,21 @@ function handleSignalMessage(msg) {
 
 function renderPeers() {
   const nodes = [];
-  nodes.push(peerCard(state.peerId, true));
-  for (const id of state.peers) nodes.push(peerCard(id, false));
+  nodes.push(peerCard({ id: state.peerId, name: state.deviceName }, true));
+  for (const peer of state.peers) nodes.push(peerCard(peer, false));
   if (state.peers.length === 0) {
     nodes.push(`<div class="peer empty">Aguardando outro aparelho…</div>`);
   }
   el.peers.innerHTML = nodes.join("");
 }
 
-function peerCard(id, isYou) {
+function peerCard(peer, isYou) {
+  const name = peer?.name || "Aparelho";
   return `
     <div class="peer ${isYou ? "you" : ""}">
-      <div class="peer-avatar">${shortId(id).slice(0, 2)}</div>
-      <strong>${isYou ? "Você" : `Aparelho ${shortId(id)}`}</strong>
-      <span>${isYou ? "nesta rede" : "conectado"}</span>
+      <div class="peer-avatar">${initials(name)}</div>
+      <strong>${isYou ? "Você" : escapeHtml(name)}</strong>
+      <span>${isYou ? escapeHtml(name) : "conectado"}</span>
     </div>
   `;
 }
@@ -214,13 +313,15 @@ function updateTargetSelect() {
     el.sendBtn.disabled = true;
     return;
   }
-  for (const id of state.peers) {
+  for (const peer of state.peers) {
     const opt = document.createElement("option");
-    opt.value = id;
-    opt.textContent = `Aparelho ${shortId(id)}`;
+    opt.value = peer.id;
+    opt.textContent = peer.name;
     el.targetSelect.appendChild(opt);
   }
-  if (previous && state.peers.includes(previous)) el.targetSelect.value = previous;
+  if (previous && state.peers.some((peer) => peer.id === previous)) {
+    el.targetSelect.value = previous;
+  }
   el.targetSelect.disabled = false;
   el.sendBtn.disabled = state.selectedFiles.length === 0;
 }
@@ -371,6 +472,7 @@ function escapeHtml(value) {
 async function sendFilesTo(peerId, files) {
   const conn = await ensureConnection(peerId, true);
   await waitForOpen(conn.channel);
+  const targetName = peerName(peerId);
 
   for (const file of files) {
     const transferId = crypto.randomUUID();
@@ -378,7 +480,7 @@ async function sendFilesTo(peerId, files) {
       id: transferId,
       name: file.name,
       size: file.size,
-      direction: `Enviando → ${shortId(peerId)}`,
+      direction: `Enviando → ${targetName}`,
     });
 
     conn.channel.send(
@@ -404,12 +506,12 @@ async function sendFilesTo(peerId, files) {
       updateTransferProgress(
         transferId,
         offset / file.size,
-        `Enviando → ${shortId(peerId)} · ${formatBytes(offset)} / ${formatBytes(file.size)}`
+        `Enviando → ${targetName} · ${formatBytes(offset)} / ${formatBytes(file.size)}`
       );
     }
 
     conn.channel.send(JSON.stringify({ kind: "done", transferId }));
-    updateTransferProgress(transferId, 1, `Enviado → ${shortId(peerId)} · ${formatBytes(file.size)}`);
+    updateTransferProgress(transferId, 1, `Enviado → ${targetName} · ${formatBytes(file.size)}`);
   }
 }
 
@@ -429,7 +531,7 @@ function onChannelMessage(peerId, data) {
         id: msg.transferId,
         name: msg.name,
         size: msg.size,
-        direction: `Recebendo ← ${shortId(peerId)}`,
+        direction: `Recebendo ← ${peerName(peerId)}`,
       });
       return;
     }
@@ -452,7 +554,7 @@ function onChannelMessage(peerId, data) {
   updateTransferProgress(
     transferId,
     entry.received / entry.size,
-    `Recebendo ← ${shortId(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)}`
+    `Recebendo ← ${peerName(peerId)} · ${formatBytes(entry.received)} / ${formatBytes(entry.size)}`
   );
 }
 
@@ -469,14 +571,15 @@ function finalizeIncoming(transferId) {
   updateTransferProgress(
     transferId,
     1,
-    `Recebido ← ${shortId(entry.peerId)} · ${formatBytes(entry.size)}`
+    `Recebido ← ${peerName(entry.peerId)} · ${formatBytes(entry.size)}`
   );
   state.incoming.delete(transferId);
   showToast(`Arquivo recebido: ${entry.name}`);
 }
 
 function createRoom() {
-  send("create-room");
+  const name = persistDeviceName(currentDeviceName());
+  send("create-room", { name });
 }
 
 function joinRoom(code) {
@@ -485,7 +588,8 @@ function joinRoom(code) {
     showToast("Código inválido (6 caracteres)");
     return;
   }
-  send("join-room", { code: normalized });
+  const name = persistDeviceName(currentDeviceName());
+  send("join-room", { code: normalized, name });
 }
 
 function setSelectedFiles(fileList) {
@@ -584,4 +688,16 @@ el.sendBtn.addEventListener("click", async () => {
   }
 });
 
-connectSocket();
+el.deviceNameInput?.addEventListener("change", () => {
+  persistDeviceName(el.deviceNameInput.value);
+});
+
+el.deviceNameInput?.addEventListener("blur", () => {
+  persistDeviceName(el.deviceNameInput.value || state.deviceName);
+});
+
+(async () => {
+  const detected = await detectDeviceName();
+  persistDeviceName(detected);
+  connectSocket();
+})();
