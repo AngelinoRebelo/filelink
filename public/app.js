@@ -30,6 +30,7 @@ const el = {
   sendBtn: document.getElementById("sendBtn"),
   transfers: document.getElementById("transfers"),
   toast: document.getElementById("toast"),
+  keepAwakeBanner: document.getElementById("keepAwakeBanner"),
   scanModal: document.getElementById("scanModal"),
   scanVideo: document.getElementById("scanVideo"),
   scanCanvas: document.getElementById("scanCanvas"),
@@ -50,6 +51,14 @@ const state = {
   connections: new Map(),
   incoming: new Map(),
   batches: new Map(),
+  intentionalClose: false,
+  reconnectTimer: 0,
+  transferActive: 0,
+  wakeLock: null,
+  noSleepVideo: null,
+  noSleepDraw: null,
+  noSleepRaf: 0,
+  keepAwakeHintShown: false,
   scan: {
     stream: null,
     timer: 0,
@@ -211,16 +220,131 @@ function wsUrl() {
   return `${proto}//${location.host}/ws`;
 }
 
+function ensureNoSleepVideo() {
+  if (state.noSleepVideo) return state.noSleepVideo;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 2;
+  canvas.height = 2;
+  const ctx = canvas.getContext("2d");
+  const draw = () => {
+    if (!ctx) return;
+    ctx.fillStyle = state.transferActive > 0 ? "#010101" : "#000";
+    ctx.fillRect(0, 0, 2, 2);
+    if (state.transferActive > 0) {
+      state.noSleepRaf = requestAnimationFrame(draw);
+    }
+  };
+
+  const video = document.createElement("video");
+  video.setAttribute("playsinline", "true");
+  video.setAttribute("webkit-playsinline", "true");
+  video.setAttribute("muted", "true");
+  video.muted = true;
+  video.loop = true;
+  video.playsInline = true;
+  video.style.cssText =
+    "position:fixed;width:1px;height:1px;left:-10px;top:-10px;opacity:0;pointer-events:none;";
+
+  if (canvas.captureStream) {
+    video.srcObject = canvas.captureStream(4);
+  }
+
+  document.body.appendChild(video);
+  state.noSleepVideo = video;
+  state.noSleepDraw = draw;
+  return video;
+}
+
+async function acquireKeepAwake() {
+  el.keepAwakeBanner?.classList.remove("hidden");
+
+  try {
+    if (navigator.wakeLock?.request && document.visibilityState === "visible") {
+      state.wakeLock = await navigator.wakeLock.request("screen");
+      state.wakeLock.addEventListener("release", () => {
+        if (state.transferActive > 0 && document.visibilityState === "visible") {
+          acquireKeepAwake();
+        }
+      });
+    }
+  } catch {
+    // continue with video fallback
+  }
+
+  try {
+    const video = ensureNoSleepVideo();
+    state.noSleepDraw?.();
+    await video.play();
+  } catch {
+    // autoplay may require gesture; send/receive actions usually unlock it
+  }
+
+  if (!state.keepAwakeHintShown) {
+    state.keepAwakeHintShown = true;
+    showToast("Tela mantida ligada durante o envio");
+  }
+}
+
+function releaseKeepAwake() {
+  el.keepAwakeBanner?.classList.add("hidden");
+  try {
+    state.wakeLock?.release?.();
+  } catch {}
+  state.wakeLock = null;
+  if (state.noSleepRaf) {
+    cancelAnimationFrame(state.noSleepRaf);
+    state.noSleepRaf = 0;
+  }
+  try {
+    state.noSleepVideo?.pause?.();
+  } catch {}
+}
+
+async function beginTransferKeepAwake() {
+  state.transferActive += 1;
+  if (state.transferActive === 1) await acquireKeepAwake();
+}
+
+function endTransferKeepAwake() {
+  state.transferActive = Math.max(0, state.transferActive - 1);
+  if (state.transferActive === 0) releaseKeepAwake();
+}
+
+function markTransfersInterrupted(reason) {
+  for (const item of el.transfers?.querySelectorAll(".transfer") || []) {
+    const bar = item.querySelector(".bar > span");
+    const meta = item.querySelector(".transfer-meta");
+    if (!meta) continue;
+    if (meta.textContent.includes("Enviado") || meta.textContent.includes("Recebido")) continue;
+    if (meta.textContent.includes("interromp")) continue;
+    meta.textContent = `${meta.textContent.split(" · ")[0]} · ${reason}`;
+    if (bar && bar.style.width !== "100%") bar.style.width = bar.style.width || "0%";
+  }
+}
+
 function connectSocket() {
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = 0;
+  }
+
   const ws = new WebSocket(wsUrl());
   state.ws = ws;
   setStatus("Conectando…");
 
   ws.addEventListener("open", () => {
     setStatus("Online");
+    if (state.roomCode) {
+      send("join-room", {
+        code: state.roomCode,
+        name: currentDeviceName(),
+      });
+      return;
+    }
     const params = new URLSearchParams(location.search);
     const code = params.get("code");
-    if (code && !state.roomCode) {
+    if (code) {
       el.codeInput.value = code.toUpperCase();
       el.joinForm.classList.remove("hidden");
       joinRoom(code);
@@ -228,9 +352,17 @@ function connectSocket() {
   });
 
   ws.addEventListener("close", () => {
+    if (state.intentionalClose) {
+      state.intentionalClose = false;
+      return;
+    }
     setStatus("Reconectando…");
     cleanupConnections();
-    setTimeout(connectSocket, 1200);
+    if (state.transferActive > 0) {
+      markTransfersInterrupted("interrompido (tela/app em segundo plano)");
+      showToast("Transferência pausada — mantenha a tela ligada");
+    }
+    state.reconnectTimer = setTimeout(connectSocket, document.visibilityState === "hidden" ? 2500 : 1000);
   });
 
   ws.addEventListener("message", (event) => {
@@ -605,69 +737,74 @@ function escapeHtml(value) {
 }
 
 async function sendFilesTo(peerId, files) {
-  const transport = await openTransport(peerId);
-  const targetName = peerName(peerId);
-  const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
-  const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
-  const list = [...files];
-  const batchId = list.length > 1 ? crypto.randomUUID() : null;
+  await beginTransferKeepAwake();
+  try {
+    const transport = await openTransport(peerId);
+    const targetName = peerName(peerId);
+    const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
+    const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
+    const list = [...files];
+    const batchId = list.length > 1 ? crypto.randomUUID() : null;
 
-  if (batchId) {
-    await transport.send(
-      JSON.stringify({
-        kind: "batch-start",
-        batchId,
-        count: list.length,
-      })
-    );
-  }
-
-  for (const file of list) {
-    const transferId = crypto.randomUUID();
-    createTransferItem({
-      id: transferId,
-      name: file.name,
-      size: file.size,
-      direction: `Enviando → ${targetName}`,
-    });
-
-    await transport.send(
-      JSON.stringify({
-        kind: "meta",
-        transferId,
-        batchId,
-        name: file.name,
-        size: file.size,
-        type: file.type || "application/octet-stream",
-      })
-    );
-
-    let offset = 0;
-    const speedMeter = createSpeedMeter();
-    while (offset < file.size) {
-      const chunk = file.slice(offset, offset + chunkSize);
-      const buffer = await chunk.arrayBuffer();
-      await transport.send(buffer);
-      offset += buffer.byteLength;
-      const { instant } = speedMeter.update(offset);
-      updateTransferProgress(
-        transferId,
-        offset / file.size,
-        `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)}`
+    if (batchId) {
+      await transport.send(
+        JSON.stringify({
+          kind: "batch-start",
+          batchId,
+          count: list.length,
+        })
       );
     }
 
-    await transport.send(JSON.stringify({ kind: "done", transferId, batchId }));
-    const avgSpeed = speedMeter.finish(file.size);
-    updateTransferProgress(
-      transferId,
-      1,
-      `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
-    );
-  }
+    for (const file of list) {
+      const transferId = crypto.randomUUID();
+      createTransferItem({
+        id: transferId,
+        name: file.name,
+        size: file.size,
+        direction: `Enviando → ${targetName}`,
+      });
 
-  if (batchId) {
-    await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+      await transport.send(
+        JSON.stringify({
+          kind: "meta",
+          transferId,
+          batchId,
+          name: file.name,
+          size: file.size,
+          type: file.type || "application/octet-stream",
+        })
+      );
+
+      let offset = 0;
+      const speedMeter = createSpeedMeter();
+      while (offset < file.size) {
+        const chunk = file.slice(offset, offset + chunkSize);
+        const buffer = await chunk.arrayBuffer();
+        await transport.send(buffer);
+        offset += buffer.byteLength;
+        const { instant } = speedMeter.update(offset);
+        updateTransferProgress(
+          transferId,
+          offset / file.size,
+          `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)}`
+        );
+      }
+
+      await transport.send(JSON.stringify({ kind: "done", transferId, batchId }));
+      const avgSpeed = speedMeter.finish(file.size);
+      updateTransferProgress(
+        transferId,
+        1,
+        `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
+      );
+    }
+
+    if (batchId) {
+      await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+    }
+  } finally {
+    endTransferKeepAwake();
   }
 }
 
@@ -744,6 +881,7 @@ function onChannelMessage(peerId, data) {
         chunks: [],
         speedMeter: createSpeedMeter(),
       });
+      beginTransferKeepAwake();
       createTransferItem({
         id: msg.transferId,
         name: msg.name,
@@ -794,11 +932,13 @@ function finalizeIncoming(transferId) {
   if (entry.batchId && state.batches.has(entry.batchId)) {
     const batch = state.batches.get(entry.batchId);
     batch.files.push({ name: entry.name, blob });
+    endTransferKeepAwake();
     return;
   }
 
   downloadBlob(blob, entry.name);
   showToast(`Arquivo recebido: ${entry.name}`);
+  endTransferKeepAwake();
 }
 
 async function flushBatch(batchId) {
@@ -1128,8 +1268,16 @@ el.shareBtn.addEventListener("click", async () => {
 });
 
 el.leaveBtn.addEventListener("click", () => {
-  state.ws?.close();
+  state.intentionalClose = true;
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = 0;
+  }
+  const ws = state.ws;
   leaveRoomUI();
+  releaseKeepAwake();
+  state.transferActive = 0;
+  ws?.close();
   connectSocket();
 });
 
@@ -1192,6 +1340,21 @@ el.deviceNameInput?.addEventListener("change", () => {
 el.deviceNameInput?.addEventListener("blur", () => {
   persistDeviceName(el.deviceNameInput.value || state.deviceName);
 });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (state.transferActive > 0) acquireKeepAwake();
+    if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
+      connectSocket();
+    }
+  }
+});
+
+setInterval(() => {
+  if (state.ws?.readyState === WebSocket.OPEN && state.roomCode) {
+    send("ping");
+  }
+}, 20000);
 
 (async () => {
   const detected = await detectDeviceName();
