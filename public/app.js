@@ -32,6 +32,11 @@ const el = {
   fileQueue: document.getElementById("fileQueue"),
   targetSelect: document.getElementById("targetSelect"),
   sendBtn: document.getElementById("sendBtn"),
+  transferControls: document.getElementById("transferControls"),
+  pauseSendBtn: document.getElementById("pauseSendBtn"),
+  resumeSendBtn: document.getElementById("resumeSendBtn"),
+  stopSendBtn: document.getElementById("stopSendBtn"),
+  transferControlsHint: document.getElementById("transferControlsHint"),
   transfers: document.getElementById("transfers"),
   toast: document.getElementById("toast"),
   keepAwakeBanner: document.getElementById("keepAwakeBanner"),
@@ -52,6 +57,12 @@ const state = {
   roomCode: null,
   peers: [],
   selectedFiles: [],
+  transferRecords: new Map(),
+  sendJob: {
+    active: false,
+    paused: false,
+    stopped: false,
+  },
   connections: new Map(),
   incoming: new Map(),
   batches: new Map(),
@@ -229,9 +240,9 @@ function createOperationMeter(totalBytes) {
       const elapsed = Math.max(0.001, (now - startedAt) / 1000);
       const remaining = Math.max(0, totalBytes - transferred);
       // Wait until we have a meaningful sample so early spikes don't skew ETA.
-      const ready = elapsed >= 1 && transferred >= 256 * 1024;
-      const rate = ready ? transferred / elapsed : NaN;
-      const etaSeconds = ready && rate > 0 ? remaining / rate : NaN;
+      const ready = remaining === 0 || (elapsed >= 1 && transferred >= 256 * 1024);
+      const rate = ready || remaining === 0 ? transferred / elapsed : NaN;
+      const etaSeconds = ready && rate > 0 && remaining > 0 ? remaining / rate : remaining === 0 ? 0 : NaN;
       const shouldRender = now - lastUiAt >= 200 || remaining === 0;
       if (shouldRender) lastUiAt = now;
       return {
@@ -463,8 +474,11 @@ function leaveRoomUI() {
   state.peers = [];
   state.selectedFiles = [];
   state.batches.clear();
+  state.transferRecords.clear();
+  if (el.transfers) el.transfers.innerHTML = "";
   el.fileInput.value = "";
   renderFileQueue();
+  updateSendControls();
   if (el.roomQr) {
     el.roomQr.removeAttribute("src");
     el.roomQr.alt = "QR code da rede";
@@ -574,7 +588,7 @@ function updateTargetSelect() {
   if (state.peers.length === 0) {
     el.targetSelect.innerHTML = `<option value="">Aguardando aparelhos…</option>`;
     el.targetSelect.disabled = true;
-    el.sendBtn.disabled = true;
+    updateSendControls();
     return;
   }
   for (const peer of state.peers) {
@@ -587,7 +601,7 @@ function updateTargetSelect() {
     el.targetSelect.value = previous;
   }
   el.targetSelect.disabled = false;
-  el.sendBtn.disabled = state.selectedFiles.length === 0;
+  updateSendControls();
 }
 
 function cleanupConnections() {
@@ -837,7 +851,15 @@ async function openTransport(peerId, { forceRelay = false } = {}) {
   return createRelayTransport(peerId);
 }
 
-function createTransferItem({ id, name, size, direction }) {
+function createTransferItem({
+  id,
+  name,
+  size,
+  direction,
+  file = null,
+  peerId = null,
+  status = "sending",
+}) {
   const li = document.createElement("li");
   li.className = "transfer";
   li.dataset.id = id;
@@ -847,9 +869,106 @@ function createTransferItem({ id, name, size, direction }) {
       <span class="transfer-meta">${direction} · ${formatBytes(size)}</span>
     </div>
     <div class="bar"><span style="width:0%"></span></div>
+    <div class="transfer-actions">
+      <button type="button" class="btn btn-ghost hidden" data-transfer-action="pause">Pausar</button>
+      <button type="button" class="btn btn-ghost hidden" data-transfer-action="resume">Continuar</button>
+      <button type="button" class="btn btn-danger hidden" data-transfer-action="stop">Parar</button>
+      <button type="button" class="btn btn-ghost hidden" data-transfer-action="resend">Reenviar</button>
+    </div>
   `;
   el.transfers.prepend(li);
+  state.transferRecords.set(id, {
+    file,
+    peerId,
+    name,
+    size,
+    status,
+  });
+  setTransferActions(id, status);
   return li;
+}
+
+function setTransferActions(id, status) {
+  const item = el.transfers.querySelector(`[data-id="${id}"]`);
+  const record = state.transferRecords.get(id);
+  if (!item) return;
+  if (record) record.status = status;
+
+  const pauseBtn = item.querySelector('[data-transfer-action="pause"]');
+  const resumeBtn = item.querySelector('[data-transfer-action="resume"]');
+  const stopBtn = item.querySelector('[data-transfer-action="stop"]');
+  const resendBtn = item.querySelector('[data-transfer-action="resend"]');
+
+  pauseBtn?.classList.toggle("hidden", status !== "sending");
+  resumeBtn?.classList.toggle("hidden", status !== "paused");
+  stopBtn?.classList.toggle("hidden", status !== "sending" && status !== "paused");
+  resendBtn?.classList.toggle(
+    "hidden",
+    !(record?.file && ["sent", "stopped", "error"].includes(status))
+  );
+}
+
+function updateSendControls() {
+  const active = state.sendJob.active;
+  el.transferControls?.classList.toggle("hidden", !active);
+  el.pauseSendBtn?.classList.toggle("hidden", !active || state.sendJob.paused);
+  el.resumeSendBtn?.classList.toggle("hidden", !active || !state.sendJob.paused);
+  el.stopSendBtn?.classList.toggle("hidden", !active);
+  if (el.transferControlsHint) {
+    el.transferControlsHint.textContent = !active
+      ? ""
+      : state.sendJob.paused
+        ? "Envio pausado"
+        : "Enviando…";
+  }
+  el.sendBtn.disabled =
+    state.sendJob.active || state.selectedFiles.length === 0 || state.peers.length === 0;
+}
+
+function pauseSending() {
+  if (!state.sendJob.active || state.sendJob.stopped) return;
+  state.sendJob.paused = true;
+  updateSendControls();
+  for (const [id, record] of state.transferRecords) {
+    if (record.status === "sending") {
+      setTransferActions(id, "paused");
+      const item = el.transfers.querySelector(`[data-id="${id}"]`);
+      const meta = item?.querySelector(".transfer-meta");
+      if (meta && !meta.textContent.includes("Pausado")) {
+        meta.textContent = `${meta.textContent.split(" · ")[0]} · Pausado`;
+      }
+    }
+  }
+  showToast("Envio pausado");
+}
+
+function resumeSending() {
+  if (!state.sendJob.active || state.sendJob.stopped) return;
+  state.sendJob.paused = false;
+  updateSendControls();
+  for (const [id, record] of state.transferRecords) {
+    if (record.status === "paused") setTransferActions(id, "sending");
+  }
+  showToast("Envio retomado");
+}
+
+function stopSending() {
+  if (!state.sendJob.active) return;
+  state.sendJob.stopped = true;
+  state.sendJob.paused = false;
+  updateSendControls();
+  showToast("Parando envio…");
+}
+
+async function waitWhilePaused() {
+  while (state.sendJob.paused && !state.sendJob.stopped) {
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  if (state.sendJob.stopped) {
+    const err = new Error("Envio parado");
+    err.code = "TRANSFER_STOPPED";
+    throw err;
+  }
 }
 
 function updateTransferProgress(id, ratio, meta) {
@@ -879,15 +998,30 @@ async function sendOneFile(
   const id = transferId || crypto.randomUUID();
   const meter = operationMeter || createOperationMeter(file.size);
 
-  if (!transferId) {
+  if (!el.transfers.querySelector(`[data-id="${id}"]`)) {
     createTransferItem({
       id,
       name: file.name,
       size: file.size,
       direction: `Enviando → ${targetName}`,
+      file,
+      peerId,
     });
+  } else {
+    const record = state.transferRecords.get(id) || {};
+    state.transferRecords.set(id, {
+      ...record,
+      file,
+      peerId,
+      name: file.name,
+      size: file.size,
+      status: "sending",
+    });
+    setTransferActions(id, "sending");
+    updateTransferProgress(id, 0, `Enviando → ${targetName}`);
   }
 
+  await waitWhilePaused();
   await transport.send(
     JSON.stringify({
       kind: "meta",
@@ -904,9 +1038,9 @@ async function sendOneFile(
     offset < file.size ? file.slice(offset, offset + chunkSize).arrayBuffer() : null;
 
   while (offset < file.size && nextRead) {
+    await waitWhilePaused();
     const buffer = await nextRead;
     offset += buffer.byteLength;
-    // Prefetch the next chunk while this one is in flight.
     nextRead =
       offset < file.size ? file.slice(offset, offset + chunkSize).arrayBuffer() : null;
 
@@ -926,6 +1060,7 @@ async function sendOneFile(
     );
   }
 
+  await waitWhilePaused();
   await transport.send(JSON.stringify({ kind: "done", transferId: id, batchId }));
   meter.markFileDone(file.size);
   const snap = meter.snapshot(0);
@@ -938,10 +1073,15 @@ async function sendOneFile(
     fileCount > 1 ? snap.transferred / Math.max(1, meter.totalBytes) : 1,
     `Enviado → ${targetName} · ${via} · ${doneProgress} · média ${formatSpeed(snap.rate)}`
   );
+  setTransferActions(id, "sent");
   return id;
 }
 
-async function sendFilesTo(peerId, files) {
+async function sendFilesTo(peerId, files, { reuseTransferIds = null } = {}) {
+  state.sendJob.active = true;
+  state.sendJob.paused = false;
+  state.sendJob.stopped = false;
+  updateSendControls();
   await beginTransferKeepAwake();
   try {
     let transport = await openTransport(peerId);
@@ -962,14 +1102,19 @@ async function sendFilesTo(peerId, files) {
     }
 
     for (let index = 0; index < list.length; index += 1) {
+      await waitWhilePaused();
       const file = list[index];
-      const transferId = crypto.randomUUID();
-      createTransferItem({
-        id: transferId,
-        name: file.name,
-        size: file.size,
-        direction: `Enviando → ${peerName(peerId)}`,
-      });
+      const transferId = reuseTransferIds?.[index] || crypto.randomUUID();
+      if (!reuseTransferIds?.[index]) {
+        createTransferItem({
+          id: transferId,
+          name: file.name,
+          size: file.size,
+          direction: `Enviando → ${peerName(peerId)}`,
+          file,
+          peerId,
+        });
+      }
 
       const opts = {
         batchId,
@@ -982,6 +1127,27 @@ async function sendFilesTo(peerId, files) {
       try {
         await sendOneFile(transport, peerId, file, opts);
       } catch (err) {
+        if (err.code === "TRANSFER_STOPPED") {
+          setTransferActions(transferId, "stopped");
+          updateTransferProgress(transferId, 0, `Parado → ${peerName(peerId)}`);
+          for (let rest = index + 1; rest < list.length; rest += 1) {
+            const restId = reuseTransferIds?.[rest] || crypto.randomUUID();
+            if (!reuseTransferIds?.[rest]) {
+              createTransferItem({
+                id: restId,
+                name: list[rest].name,
+                size: list[rest].size,
+                direction: `Parado → ${peerName(peerId)}`,
+                file: list[rest],
+                peerId,
+              });
+            }
+            setTransferActions(restId, "stopped");
+            updateTransferProgress(restId, 0, `Parado → ${peerName(peerId)} · não enviado`);
+          }
+          throw err;
+        }
+
         closePeer(peerId);
         transport = await openTransport(peerId, { forceRelay: true });
         if (batchId) {
@@ -1010,7 +1176,46 @@ async function sendFilesTo(peerId, files) {
       }
     }
   } finally {
+    state.sendJob.active = false;
+    state.sendJob.paused = false;
+    state.sendJob.stopped = false;
+    updateSendControls();
     endTransferKeepAwake();
+  }
+}
+
+async function resendTransfer(transferId) {
+  const record = state.transferRecords.get(transferId);
+  if (!record?.file) {
+    showToast("Arquivo indisponível para reenviar");
+    return;
+  }
+  if (state.sendJob.active) {
+    showToast("Aguarde o envio atual terminar");
+    return;
+  }
+
+  let peerId = el.targetSelect.value;
+  if (!peerId || !state.peers.some((peer) => peer.id === peerId)) {
+    peerId = state.peers.some((peer) => peer.id === record.peerId)
+      ? record.peerId
+      : state.peers[0]?.id;
+  }
+  if (!peerId) {
+    showToast("Escolha o aparelho em Enviar para");
+    return;
+  }
+
+  try {
+    updateTransferProgress(transferId, 0, `Reenviando → ${peerName(peerId)}`);
+    setTransferActions(transferId, "sending");
+    await sendFilesTo(peerId, [record.file], { reuseTransferIds: [transferId] });
+    showToast("Reenvio concluído");
+  } catch (err) {
+    if (err.code !== "TRANSFER_STOPPED") {
+      setTransferActions(transferId, "error");
+      showToast(err.message || "Falha no reenvio");
+    }
   }
 }
 
@@ -1102,6 +1307,7 @@ function onChannelMessage(peerId, data) {
         name: msg.name,
         size: msg.size,
         direction: `Recebendo ← ${peerName(peerId)}`,
+        status: "receiving",
       });
       return;
     }
@@ -1406,7 +1612,8 @@ function renderFileQueue() {
     )
     .join("");
 
-  el.sendBtn.disabled = state.peers.length === 0;
+  el.sendBtn.disabled =
+    state.sendJob.active || state.selectedFiles.length === 0 || state.peers.length === 0;
 }
 
 function setSelectedFiles(fileList, { append = false } = {}) {
@@ -1548,20 +1755,42 @@ el.dropzone.addEventListener("drop", (event) => {
 
 el.sendBtn.addEventListener("click", async () => {
   const target = el.targetSelect.value;
-  if (!target || state.selectedFiles.length === 0) return;
+  // Only newly queued files are sent by Enviar.
+  if (!target || state.selectedFiles.length === 0 || state.sendJob.active) return;
   el.sendBtn.disabled = true;
   const filesToSend = [...state.selectedFiles];
+  state.selectedFiles = [];
+  el.fileInput.value = "";
+  renderFileQueue();
   try {
     await sendFilesTo(target, filesToSend);
     showToast("Envio concluído");
-    state.selectedFiles = [];
-    el.fileInput.value = "";
-    renderFileQueue();
   } catch (err) {
-    showToast(err.message || "Falha no envio");
+    if (err.code === "TRANSFER_STOPPED") {
+      showToast("Envio parado");
+    } else {
+      showToast(err.message || "Falha no envio");
+    }
   } finally {
-    el.sendBtn.disabled = state.selectedFiles.length === 0 || state.peers.length === 0;
+    updateSendControls();
   }
+});
+
+el.pauseSendBtn?.addEventListener("click", pauseSending);
+el.resumeSendBtn?.addEventListener("click", resumeSending);
+el.stopSendBtn?.addEventListener("click", stopSending);
+
+el.transfers?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-transfer-action]");
+  if (!button) return;
+  const item = button.closest(".transfer");
+  const transferId = item?.dataset.id;
+  if (!transferId) return;
+  const action = button.dataset.transferAction;
+  if (action === "pause") pauseSending();
+  if (action === "resume") resumeSending();
+  if (action === "stop") stopSending();
+  if (action === "resend") resendTransfer(transferId);
 });
 
 el.deviceNameInput?.addEventListener("change", () => {

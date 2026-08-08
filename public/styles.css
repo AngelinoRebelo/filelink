@@ -436,6 +436,31 @@ main {
   margin-top: 0.9rem;
 }
 
+.transfer-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+  margin-top: 0.85rem;
+}
+
+.transfer-controls-hint {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.transfer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.65rem;
+}
+
+.transfer-actions .btn {
+  padding: 0.45rem 0.85rem;
+  font-size: 0.82rem;
+}
+
 .send-row label {
   color: var(--muted);
   font-size: 0.9rem;

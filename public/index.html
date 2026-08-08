@@ -109,6 +109,13 @@
             </select>
             <button type="button" class="btn btn-primary" id="sendBtn" disabled>Enviar</button>
           </div>
+
+          <div class="transfer-controls hidden" id="transferControls">
+            <button type="button" class="btn btn-ghost" id="pauseSendBtn">Pausar</button>
+            <button type="button" class="btn btn-ghost hidden" id="resumeSendBtn">Continuar</button>
+            <button type="button" class="btn btn-danger" id="stopSendBtn">Parar</button>
+            <span class="transfer-controls-hint" id="transferControlsHint">Enviando…</span>
+          </div>
         </div>
 
         <ul class="transfers" id="transfers" aria-live="polite"></ul>
