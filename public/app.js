@@ -348,12 +348,24 @@ function connectSocket() {
     state.reconnectTimer = 0;
   }
 
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
   const ws = new WebSocket(wsUrl());
   state.ws = ws;
   setStatus("Conectando…");
 
   ws.addEventListener("open", () => {
-    setStatus("Online");
+    setStatus(state.roomCode ? "Online" : "Online");
+    if (state.roomCode && state.peerId) {
+      send("rejoin-room", {
+        code: state.roomCode,
+        peerId: state.peerId,
+        name: currentDeviceName(),
+      });
+      return;
+    }
     if (state.roomCode) {
       send("join-room", {
         code: state.roomCode,
@@ -375,13 +387,9 @@ function connectSocket() {
       state.intentionalClose = false;
       return;
     }
-    setStatus("Reconectando…");
-    cleanupConnections();
-    if (state.transferActive > 0) {
-      markTransfersInterrupted("interrompido (tela/app em segundo plano)");
-      showToast("Transferência pausada — mantenha a tela ligada");
-    }
-    state.reconnectTimer = setTimeout(connectSocket, document.visibilityState === "hidden" ? 2500 : 1000);
+    // Keep P2P/data channels alive during brief signaling drops.
+    setStatus(state.roomCode ? "Reconectando sinal…" : "Reconectando…");
+    state.reconnectTimer = setTimeout(connectSocket, document.visibilityState === "hidden" ? 2000 : 800);
   });
 
   ws.addEventListener("message", (event) => {
@@ -455,9 +463,16 @@ function leaveRoomUI() {
 function handleSignalMessage(msg) {
   switch (msg.type) {
     case "room-created":
+      enterRoom(msg.code, msg.peerId, msg.peers, msg.name);
+      showToast("Pronto para transferir");
+      break;
     case "room-joined":
       enterRoom(msg.code, msg.peerId, msg.peers, msg.name);
-      showToast(msg.type === "room-created" ? "Rede criada" : "Você entrou na rede");
+      showToast("Você entrou na rede");
+      break;
+    case "room-rejoined":
+      enterRoom(msg.code, msg.peerId, msg.peers, msg.name);
+      setStatus("Online");
       break;
     case "peers":
       state.peers = normalizePeers(msg.peers);
@@ -474,12 +489,31 @@ function handleSignalMessage(msg) {
       showToast(`${name} entrou`);
       break;
     }
+    case "peer-back": {
+      const name = sanitizeDeviceName(msg.name) || peerName(msg.peerId);
+      if (!state.peers.some((peer) => peer.id === msg.peerId)) {
+        state.peers.push({ id: msg.peerId, name });
+      } else {
+        state.peers = state.peers.map((peer) =>
+          peer.id === msg.peerId ? { ...peer, name } : peer
+        );
+      }
+      renderPeers();
+      updateTargetSelect();
+      break;
+    }
+    case "peer-away":
+      // Temporary signaling drop — keep P2P/transfer state.
+      break;
     case "peer-left": {
       const leftName = peerName(msg.peerId);
       state.peers = state.peers.filter((peer) => peer.id !== msg.peerId);
       closePeer(msg.peerId);
       renderPeers();
       updateTargetSelect();
+      if (state.transferActive > 0) {
+        markTransfersInterrupted("interrompido (aparelho saiu)");
+      }
       showToast(`${leftName} saiu`);
       break;
     }
@@ -591,8 +625,13 @@ function wireChannel(peerId, channel) {
   if (!conn) return;
   conn.channel = channel;
   channel.binaryType = "arraybuffer";
-
   channel.onmessage = (event) => onChannelMessage(peerId, event.data);
+  channel.onerror = () => {
+    conn.failed = true;
+  };
+  channel.onclose = () => {
+    conn.failed = true;
+  };
 }
 
 async function handlePeerSignal(from, data) {
@@ -699,30 +738,43 @@ function relaySend(peerId, payload) {
   });
 }
 
-async function openTransport(peerId) {
-  try {
-    const conn = await ensureConnection(peerId, true);
-    await waitForOpen(conn.channel, conn.pc, 8000);
-    return {
-      mode: "p2p",
-      async send(payload) {
-        while (conn.channel.bufferedAmount > 8 * 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 20));
-        }
-        conn.channel.send(payload);
-      },
-    };
-  } catch {
-    closePeer(peerId);
-    showToast("Usando rede FileLink (sem Wi‑Fi compartilhado)");
-    return {
-      mode: "relay",
-      async send(payload) {
-        relaySend(peerId, payload);
-        await new Promise((r) => setTimeout(r, 8));
-      },
-    };
+function createRelayTransport(peerId) {
+  return {
+    mode: "relay",
+    async send(payload) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("Sinalização offline");
+      }
+      relaySend(peerId, payload);
+      await new Promise((r) => setTimeout(r, 8));
+    },
+  };
+}
+
+async function openTransport(peerId, { forceRelay = false } = {}) {
+  if (!forceRelay) {
+    try {
+      const conn = await ensureConnection(peerId, true);
+      await waitForOpen(conn.channel, conn.pc, 8000);
+      return {
+        mode: "p2p",
+        async send(payload) {
+          if (!conn.channel || conn.channel.readyState !== "open" || conn.failed) {
+            throw new Error("Canal P2P fechou");
+          }
+          while (conn.channel.bufferedAmount > 8 * 1024 * 1024) {
+            await new Promise((r) => setTimeout(r, 20));
+          }
+          conn.channel.send(payload);
+        },
+      };
+    } catch {
+      closePeer(peerId);
+    }
   }
+
+  showToast("Continuando pela rede FileLink");
+  return createRelayTransport(peerId);
 }
 
 function createTransferItem({ id, name, size, direction }) {
@@ -755,13 +807,61 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+async function sendOneFile(transport, peerId, file, { batchId = null, transferId = null } = {}) {
+  const targetName = peerName(peerId);
+  const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
+  const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
+  const id = transferId || crypto.randomUUID();
+
+  if (!transferId) {
+    createTransferItem({
+      id,
+      name: file.name,
+      size: file.size,
+      direction: `Enviando → ${targetName}`,
+    });
+  }
+
+  await transport.send(
+    JSON.stringify({
+      kind: "meta",
+      transferId: id,
+      batchId,
+      name: file.name,
+      size: file.size,
+      type: file.type || "application/octet-stream",
+    })
+  );
+
+  let offset = 0;
+  const speedMeter = createSpeedMeter();
+  while (offset < file.size) {
+    const chunk = file.slice(offset, offset + chunkSize);
+    const buffer = await chunk.arrayBuffer();
+    await transport.send(buffer);
+    offset += buffer.byteLength;
+    const { instant, etaSeconds } = speedMeter.update(offset, file.size);
+    updateTransferProgress(
+      id,
+      offset / file.size,
+      `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
+    );
+  }
+
+  await transport.send(JSON.stringify({ kind: "done", transferId: id, batchId }));
+  const avgSpeed = speedMeter.finish(file.size);
+  updateTransferProgress(
+    id,
+    1,
+    `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
+  );
+  return id;
+}
+
 async function sendFilesTo(peerId, files) {
   await beginTransferKeepAwake();
   try {
-    const transport = await openTransport(peerId);
-    const targetName = peerName(peerId);
-    const chunkSize = transport.mode === "relay" ? RELAY_CHUNK_SIZE : CHUNK_SIZE;
-    const via = transport.mode === "relay" ? "rede FileLink" : "P2P";
+    let transport = await openTransport(peerId);
     const list = [...files];
     const batchId = list.length > 1 ? crypto.randomUUID() : null;
 
@@ -781,46 +881,39 @@ async function sendFilesTo(peerId, files) {
         id: transferId,
         name: file.name,
         size: file.size,
-        direction: `Enviando → ${targetName}`,
+        direction: `Enviando → ${peerName(peerId)}`,
       });
 
-      await transport.send(
-        JSON.stringify({
-          kind: "meta",
-          transferId,
-          batchId,
-          name: file.name,
-          size: file.size,
-          type: file.type || "application/octet-stream",
-        })
-      );
-
-      let offset = 0;
-      const speedMeter = createSpeedMeter();
-      while (offset < file.size) {
-        const chunk = file.slice(offset, offset + chunkSize);
-        const buffer = await chunk.arrayBuffer();
-        await transport.send(buffer);
-        offset += buffer.byteLength;
-        const { instant, etaSeconds } = speedMeter.update(offset, file.size);
-        updateTransferProgress(
-          transferId,
-          offset / file.size,
-          `Enviando → ${targetName} · ${via} · ${formatBytes(offset)} / ${formatBytes(file.size)} · ${formatSpeed(instant)} · ${formatEta(etaSeconds)}`
-        );
+      try {
+        await sendOneFile(transport, peerId, file, { batchId, transferId });
+      } catch (err) {
+        // Mid-transfer P2P drops are common on mobile; continue via relay.
+        closePeer(peerId);
+        transport = await openTransport(peerId, { forceRelay: true });
+        if (batchId) {
+          await transport.send(
+            JSON.stringify({
+              kind: "batch-start",
+              batchId,
+              count: 1,
+            })
+          );
+        }
+        await sendOneFile(transport, peerId, file, { batchId, transferId });
+        if (batchId) {
+          await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+        }
+        continue;
       }
-
-      await transport.send(JSON.stringify({ kind: "done", transferId, batchId }));
-      const avgSpeed = speedMeter.finish(file.size);
-      updateTransferProgress(
-        transferId,
-        1,
-        `Enviado → ${targetName} · ${via} · ${formatBytes(file.size)} · média ${formatSpeed(avgSpeed)}`
-      );
     }
 
     if (batchId) {
-      await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+      try {
+        await transport.send(JSON.stringify({ kind: "batch-end", batchId }));
+      } catch {
+        const relay = await openTransport(peerId, { forceRelay: true });
+        await relay.send(JSON.stringify({ kind: "batch-end", batchId }));
+      }
     }
   } finally {
     endTransferKeepAwake();
@@ -1293,6 +1386,7 @@ el.leaveBtn.addEventListener("click", () => {
     state.reconnectTimer = 0;
   }
   const ws = state.ws;
+  send("leave-room");
   leaveRoomUI();
   releaseKeepAwake();
   state.transferActive = 0;
@@ -1373,7 +1467,7 @@ setInterval(() => {
   if (state.ws?.readyState === WebSocket.OPEN && state.roomCode) {
     send("ping");
   }
-}, 20000);
+}, 12000);
 
 (async () => {
   const detected = await detectDeviceName();
