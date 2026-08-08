@@ -189,24 +189,6 @@ main {
   font-size: 0.95rem;
 }
 
-.offline-help {
-  margin-top: 0.85rem;
-  max-width: 36rem;
-  color: var(--muted);
-  font-size: 0.92rem;
-}
-
-.offline-help summary {
-  cursor: pointer;
-  color: var(--ink);
-  font-weight: 600;
-}
-
-.offline-help p {
-  margin: 0.55rem 0 0;
-  line-height: 1.55;
-}
-
 .join-form {
   margin-top: 0.5rem;
   display: grid;

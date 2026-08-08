@@ -15,12 +15,6 @@ Não é necessário estar no mesmo Wi‑Fi: funciona com **dados móveis (4G/5G)
 4. No outro aparelho, use **Ler QR code** (câmera), escaneie o QR ou entre com o código.
 5. Escolha os arquivos e envie para o aparelho desejado. Vários arquivos chegam juntos em um único download (ZIP).
 
-### Sem Wi‑Fi / sem internet nenhuma
-
-1. Num aparelho, ative o **ponto de acesso (hotspot)**.
-2. No outro, conecte a essa rede Wi‑Fi criada pelo aparelho.
-3. Abra o FileLink nos dois e entre na mesma sessão (código/QR).
-
 ## Stack
 
 - Frontend: HTML, CSS, JavaScript (WebRTC DataChannel + relay)
