@@ -216,6 +216,33 @@ main {
   margin-bottom: 0.85rem;
 }
 
+.room-identity {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.qr-wrap {
+  flex: 0 0 auto;
+  padding: 0.55rem;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(232, 243, 238, 0.94);
+  box-shadow: var(--shadow);
+}
+
+.room-qr {
+  display: block;
+  width: 148px;
+  height: 148px;
+  border-radius: 8px;
+}
+
+.room-code-block {
+  min-width: 0;
+}
+
 .eyebrow {
   margin: 0 0 0.25rem;
   color: var(--muted);
@@ -436,6 +463,15 @@ main {
 @media (max-width: 700px) {
   .send-row {
     grid-template-columns: 1fr;
+  }
+
+  .room-identity {
+    width: 100%;
+  }
+
+  .room-qr {
+    width: 112px;
+    height: 112px;
   }
 
   .room-code {

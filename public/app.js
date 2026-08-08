@@ -10,6 +10,7 @@ const el = {
   joinForm: document.getElementById("joinForm"),
   codeInput: document.getElementById("codeInput"),
   roomCode: document.getElementById("roomCode"),
+  roomQr: document.getElementById("roomQr"),
   copyBtn: document.getElementById("copyBtn"),
   shareBtn: document.getElementById("shareBtn"),
   leaveBtn: document.getElementById("leaveBtn"),
@@ -100,6 +101,21 @@ function send(type, payload = {}) {
   }
 }
 
+function roomJoinUrl(code) {
+  const url = new URL(location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("code", code);
+  return url.toString();
+}
+
+function renderRoomQr(code) {
+  if (!el.roomQr || !code) return;
+  const joinUrl = roomJoinUrl(code);
+  el.roomQr.src = `/api/qr?data=${encodeURIComponent(joinUrl)}`;
+  el.roomQr.alt = `QR code para entrar na rede ${code}`;
+}
+
 function enterRoom(code, peerId, peers) {
   state.roomCode = code;
   state.peerId = peerId;
@@ -110,6 +126,7 @@ function enterRoom(code, peerId, peers) {
   const url = new URL(location.href);
   url.searchParams.set("code", code);
   history.replaceState({}, "", url);
+  renderRoomQr(code);
   renderPeers();
   updateTargetSelect();
 }
@@ -121,6 +138,10 @@ function leaveRoomUI() {
   state.peers = [];
   state.selectedFiles = [];
   el.fileInput.value = "";
+  if (el.roomQr) {
+    el.roomQr.removeAttribute("src");
+    el.roomQr.alt = "QR code da rede";
+  }
   el.lobby.classList.remove("hidden");
   el.room.classList.add("hidden");
   const url = new URL(location.href);
@@ -504,23 +525,22 @@ el.copyBtn.addEventListener("click", async () => {
 });
 
 el.shareBtn.addEventListener("click", async () => {
-  const url = new URL(location.href);
-  url.searchParams.set("code", state.roomCode);
+  const url = roomJoinUrl(state.roomCode);
   if (navigator.share) {
     try {
       await navigator.share({
         title: "FileLink",
         text: `Entre na rede ${state.roomCode} no FileLink`,
-        url: url.toString(),
+        url,
       });
       return;
     } catch {}
   }
   try {
-    await navigator.clipboard.writeText(url.toString());
+    await navigator.clipboard.writeText(url);
     showToast("Link copiado");
   } catch {
-    showToast(url.toString());
+    showToast(url);
   }
 });
 

@@ -3,12 +3,14 @@ const http = require("http");
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
+const QRCode = require("qrcode");
 
 const PORT = process.env.PORT || 3000;
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -19,6 +21,31 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, rooms: rooms.size });
+});
+
+app.get("/api/qr", async (req, res) => {
+  const data = String(req.query.data || "");
+  if (!/^https?:\/\//i.test(data) || data.length > 2048) {
+    return res.status(400).json({ error: "URL inválida para QR" });
+  }
+
+  try {
+    res.type("image/png");
+    await QRCode.toFileStream(res, data, {
+      type: "png",
+      width: 280,
+      margin: 1,
+      errorCorrectionLevel: "M",
+      color: {
+        dark: "#0b1f1a",
+        light: "#e8f3ee",
+      },
+    });
+  } catch {
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Falha ao gerar QR" });
+    }
+  }
 });
 
 function generateRoomCode() {

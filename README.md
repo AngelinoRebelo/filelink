@@ -7,8 +7,8 @@ O servidor só faz sinalização (WebSocket). Os arquivos **não passam pela nuv
 ## Como usar
 
 1. Abra o site em um aparelho e clique em **Criar rede**.
-2. Copie o código de 6 caracteres (ou compartilhe o link).
-3. No outro aparelho, abra o mesmo site e entre com o código.
+2. Mostre o **QR code** ou copie o código de 6 caracteres (também dá para compartilhar o link).
+3. No outro aparelho, escaneie o QR ou entre com o código.
 4. Escolha os arquivos e envie para o aparelho desejado.
 
 ## Stack

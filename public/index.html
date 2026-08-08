@@ -56,9 +56,14 @@
 
       <section class="room hidden" id="room">
         <div class="room-head">
-          <div>
-            <p class="eyebrow">Rede ativa</p>
-            <h2 class="room-code" id="roomCode">————</h2>
+          <div class="room-identity">
+            <div class="qr-wrap">
+              <img id="roomQr" class="room-qr" width="148" height="148" alt="QR code da rede" />
+            </div>
+            <div class="room-code-block">
+              <p class="eyebrow">Rede ativa</p>
+              <h2 class="room-code" id="roomCode">————</h2>
+            </div>
           </div>
           <div class="room-actions">
             <button type="button" class="btn btn-ghost" id="copyBtn">Copiar código</button>
@@ -67,7 +72,7 @@
           </div>
         </div>
 
-        <p class="room-help">Abra este site no outro aparelho e entre com o mesmo código.</p>
+        <p class="room-help">Escaneie o QR no outro aparelho ou entre com o mesmo código.</p>
 
         <div class="peers" id="peers"></div>
 
