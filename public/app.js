@@ -22,7 +22,10 @@ const el = {
   leaveBtn: document.getElementById("leaveBtn"),
   peers: document.getElementById("peers"),
   dropzone: document.getElementById("dropzone"),
+  dropzoneTitle: document.getElementById("dropzoneTitle"),
+  dropzoneHint: document.getElementById("dropzoneHint"),
   fileInput: document.getElementById("fileInput"),
+  fileQueue: document.getElementById("fileQueue"),
   targetSelect: document.getElementById("targetSelect"),
   sendBtn: document.getElementById("sendBtn"),
   transfers: document.getElementById("transfers"),
@@ -32,6 +35,7 @@ const el = {
   scanCanvas: document.getElementById("scanCanvas"),
   scanStatus: document.getElementById("scanStatus"),
   closeScanBtn: document.getElementById("closeScanBtn"),
+  switchCameraBtn: document.getElementById("switchCameraBtn"),
 };
 
 const DEVICE_NAME_KEY = "filelink-device-name";
@@ -48,9 +52,11 @@ const state = {
   batches: new Map(),
   scan: {
     stream: null,
-    raf: 0,
+    timer: 0,
     detector: null,
     running: false,
+    useFront: false,
+    busy: false,
   },
 };
 
@@ -248,6 +254,7 @@ function leaveRoomUI() {
   state.selectedFiles = [];
   state.batches.clear();
   el.fileInput.value = "";
+  renderFileQueue();
   if (el.roomQr) {
     el.roomQr.removeAttribute("src");
     el.roomQr.alt = "QR code da rede";
@@ -661,13 +668,13 @@ async function downloadFilesTogether(files) {
     return;
   }
 
-  if (typeof JSZip === "undefined") {
+  if (typeof window.JSZip === "undefined") {
     for (const file of files) downloadBlob(file.blob, file.name);
     showToast(`${files.length} arquivos recebidos`);
     return;
   }
 
-  const zip = new JSZip();
+  const zip = new window.JSZip();
   const used = new Set();
   for (const file of files) {
     zip.file(uniqueZipName(file.name, used), file.blob);
@@ -762,28 +769,55 @@ async function flushBatch(batchId) {
 function extractRoomCode(raw) {
   const text = String(raw || "").trim();
   if (!text) return null;
+
   try {
     const url = new URL(text);
     const code = url.searchParams.get("code");
-    if (code) return code.toUpperCase();
+    if (code) return sanitizeRoomCode(code);
   } catch {
-    // not a URL
+    // not a full URL — try embedded URL next
   }
+
+  const embeddedUrl = text.match(/https?:\/\/\S+/i)?.[0];
+  if (embeddedUrl) {
+    try {
+      const code = new URL(embeddedUrl).searchParams.get("code");
+      if (code) return sanitizeRoomCode(code);
+    } catch {
+      // ignore
+    }
+  }
+
+  const fromQuery = text.match(/[?&]code=([A-Za-z0-9]{6})/i)?.[1];
+  if (fromQuery) return sanitizeRoomCode(fromQuery);
+
   const match = text.toUpperCase().match(/\b([A-Z0-9]{6})\b/);
   return match ? match[1] : null;
 }
 
+function sanitizeRoomCode(code) {
+  const normalized = String(code || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  return /^[A-Z0-9]{6}$/.test(normalized) ? normalized : null;
+}
+
 function stopQrScanner() {
   state.scan.running = false;
-  if (state.scan.raf) {
-    cancelAnimationFrame(state.scan.raf);
-    state.scan.raf = 0;
+  state.scan.busy = false;
+  if (state.scan.timer) {
+    clearTimeout(state.scan.timer);
+    state.scan.timer = 0;
   }
   if (state.scan.stream) {
     for (const track of state.scan.stream.getTracks()) track.stop();
     state.scan.stream = null;
   }
-  if (el.scanVideo) el.scanVideo.srcObject = null;
+  if (el.scanVideo) {
+    el.scanVideo.pause?.();
+    el.scanVideo.srcObject = null;
+  }
   el.scanModal?.classList.add("hidden");
 }
 
@@ -798,98 +832,175 @@ async function handleScannedPayload(raw) {
   return true;
 }
 
-async function scanLoop() {
-  if (!state.scan.running) return;
+function captureScanFrame() {
   const video = el.scanVideo;
-  if (video.readyState >= 2) {
-    if (state.scan.detector) {
-      try {
-        const codes = await state.scan.detector.detect(video);
-        if (codes?.[0]?.rawValue && (await handleScannedPayload(codes[0].rawValue))) return;
-      } catch {
-        // keep scanning
-      }
-    } else if (typeof jsQR !== "undefined") {
-      const canvas = el.scanCanvas;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const result = jsQR(image.data, image.width, image.height, {
-        inversionAttempts: "dontInvert",
-      });
-      if (result?.data && (await handleScannedPayload(result.data))) return;
-    }
-  }
-  state.scan.raf = requestAnimationFrame(scanLoop);
+  const canvas = el.scanCanvas;
+  if (!video || !canvas || video.readyState < 2 || !video.videoWidth) return null;
+
+  const maxSide = 640;
+  const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, width, height);
+  return ctx.getImageData(0, 0, width, height);
 }
 
-async function startQrScanner() {
+async function scanOnce() {
+  if (!state.scan.running || state.scan.busy) return;
+  state.scan.busy = true;
+  try {
+    if (state.scan.detector) {
+      try {
+        const codes = await state.scan.detector.detect(el.scanVideo);
+        for (const code of codes || []) {
+          if (code?.rawValue && (await handleScannedPayload(code.rawValue))) return;
+        }
+      } catch {
+        // continue with jsQR
+      }
+    }
+
+    if (typeof window.jsQR === "function") {
+      const image = captureScanFrame();
+      if (image) {
+        const result = window.jsQR(image.data, image.width, image.height, {
+          inversionAttempts: "attemptBoth",
+        });
+        if (result?.data && (await handleScannedPayload(result.data))) return;
+      }
+    }
+  } finally {
+    state.scan.busy = false;
+  }
+}
+
+function scheduleScanLoop() {
+  if (!state.scan.running) return;
+  state.scan.timer = setTimeout(async () => {
+    await scanOnce();
+    scheduleScanLoop();
+  }, 220);
+}
+
+async function openCameraStream(useFront = false) {
+  const attempts = [
+    {
+      audio: false,
+      video: {
+        facingMode: { exact: useFront ? "user" : "environment" },
+      },
+    },
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: useFront ? "user" : "environment" },
+      },
+    },
+    {
+      audio: false,
+      video: true,
+    },
+  ];
+
+  let lastError = null;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("Câmera indisponível");
+}
+
+async function startQrScanner(useFront = state.scan.useFront) {
   if (!navigator.mediaDevices?.getUserMedia) {
     showToast("Câmera indisponível neste navegador");
     return;
   }
+  if (typeof window.jsQR !== "function" && !("BarcodeDetector" in window)) {
+    showToast("Leitor de QR indisponível");
+    return;
+  }
 
   stopQrScanner();
+  state.scan.useFront = Boolean(useFront);
   el.scanModal.classList.remove("hidden");
   el.scanStatus.textContent = "Abrindo câmera…";
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-    });
+    el.scanVideo.setAttribute("playsinline", "true");
+    el.scanVideo.setAttribute("webkit-playsinline", "true");
+    el.scanVideo.muted = true;
+
+    const stream = await openCameraStream(state.scan.useFront);
     state.scan.stream = stream;
     el.scanVideo.srcObject = stream;
     await el.scanVideo.play();
 
+    // Prefer jsQR on mobile; BarcodeDetector is optional bonus.
+    state.scan.detector = null;
     if ("BarcodeDetector" in window) {
       try {
-        state.scan.detector = new BarcodeDetector({ formats: ["qr_code"] });
+        const formats = await BarcodeDetector.getSupportedFormats?.();
+        if (!formats || formats.includes("qr_code")) {
+          state.scan.detector = new BarcodeDetector({ formats: ["qr_code"] });
+        }
       } catch {
         state.scan.detector = null;
       }
-    } else {
-      state.scan.detector = null;
-    }
-
-    if (!state.scan.detector && typeof jsQR === "undefined") {
-      el.scanStatus.textContent = "Leitor de QR indisponível";
-      return;
     }
 
     el.scanStatus.textContent = "Aponte para o QR da rede…";
     state.scan.running = true;
-    state.scan.raf = requestAnimationFrame(scanLoop);
+    scheduleScanLoop();
   } catch {
     el.scanStatus.textContent = "Permissão da câmera negada ou indisponível";
     showToast("Não foi possível abrir a câmera");
   }
 }
 
-function createRoom() {
-  const name = persistDeviceName(currentDeviceName());
-  send("create-room", { name });
-}
-
-function joinRoom(code) {
-  const normalized = String(code || "").trim().toUpperCase();
-  if (!/^[A-Z0-9]{6}$/.test(normalized)) {
-    showToast("Código inválido (6 caracteres)");
+function renderFileQueue() {
+  if (!el.fileQueue) return;
+  if (state.selectedFiles.length === 0) {
+    el.fileQueue.innerHTML = "";
+    if (el.dropzoneTitle) el.dropzoneTitle.textContent = "Solte arquivos aqui";
+    if (el.dropzoneHint) el.dropzoneHint.textContent = "ou toque para escolher";
+    el.sendBtn.disabled = true;
     return;
   }
-  const name = persistDeviceName(currentDeviceName());
-  send("join-room", { code: normalized, name });
+
+  if (el.dropzoneTitle) {
+    el.dropzoneTitle.textContent =
+      state.selectedFiles.length === 1
+        ? "1 arquivo selecionado"
+        : `${state.selectedFiles.length} arquivos selecionados`;
+  }
+  if (el.dropzoneHint) el.dropzoneHint.textContent = "toque para adicionar mais";
+
+  el.fileQueue.innerHTML = state.selectedFiles
+    .map(
+      (file, index) => `
+      <li class="file-queue-item">
+        <strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+        <span>${formatBytes(file.size)}</span>
+        <button type="button" data-remove-file="${index}">Remover</button>
+      </li>
+    `
+    )
+    .join("");
+
+  el.sendBtn.disabled = state.peers.length === 0;
 }
 
-function setSelectedFiles(fileList) {
-  state.selectedFiles = [...fileList];
-  el.sendBtn.disabled = state.selectedFiles.length === 0 || state.peers.length === 0;
+function setSelectedFiles(fileList, { append = false } = {}) {
+  const incoming = [...fileList];
+  state.selectedFiles = append ? [...state.selectedFiles, ...incoming] : incoming;
+  renderFileQueue();
   if (state.selectedFiles.length) {
     showToast(
       state.selectedFiles.length === 1
@@ -899,13 +1010,37 @@ function setSelectedFiles(fileList) {
   }
 }
 
+function removeSelectedFile(index) {
+  state.selectedFiles = state.selectedFiles.filter((_, i) => i !== index);
+  el.fileInput.value = "";
+  renderFileQueue();
+}
+
+function createRoom() {
+  const name = persistDeviceName(currentDeviceName());
+  send("create-room", { name });
+}
+
+function joinRoom(code) {
+  const normalized = sanitizeRoomCode(code);
+  if (!normalized) {
+    showToast("Código inválido (6 caracteres)");
+    return;
+  }
+  const name = persistDeviceName(currentDeviceName());
+  send("join-room", { code: normalized, name });
+}
+
 el.createBtn.addEventListener("click", createRoom);
 el.joinToggleBtn.addEventListener("click", () => {
   el.joinForm.classList.toggle("hidden");
   if (!el.joinForm.classList.contains("hidden")) el.codeInput.focus();
 });
 el.scanQrBtn?.addEventListener("click", () => {
-  startQrScanner();
+  startQrScanner(false);
+});
+el.switchCameraBtn?.addEventListener("click", () => {
+  startQrScanner(!state.scan.useFront);
 });
 el.closeScanBtn?.addEventListener("click", () => stopQrScanner());
 el.scanModal?.addEventListener("click", (event) => {
@@ -956,7 +1091,19 @@ el.leaveBtn.addEventListener("click", () => {
   connectSocket();
 });
 
-el.fileInput.addEventListener("change", () => setSelectedFiles(el.fileInput.files));
+el.fileInput.addEventListener("change", () => {
+  if (el.fileInput.files?.length) {
+    setSelectedFiles(el.fileInput.files, { append: state.selectedFiles.length > 0 });
+  }
+});
+
+el.fileQueue?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-file]");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  removeSelectedFile(Number(button.dataset.removeFile));
+});
 
 ["dragenter", "dragover"].forEach((type) => {
   el.dropzone.addEventListener(type, (event) => {
@@ -973,16 +1120,22 @@ el.fileInput.addEventListener("change", () => setSelectedFiles(el.fileInput.file
 });
 
 el.dropzone.addEventListener("drop", (event) => {
-  if (event.dataTransfer?.files?.length) setSelectedFiles(event.dataTransfer.files);
+  if (event.dataTransfer?.files?.length) {
+    setSelectedFiles(event.dataTransfer.files, { append: state.selectedFiles.length > 0 });
+  }
 });
 
 el.sendBtn.addEventListener("click", async () => {
   const target = el.targetSelect.value;
   if (!target || state.selectedFiles.length === 0) return;
   el.sendBtn.disabled = true;
+  const filesToSend = [...state.selectedFiles];
   try {
-    await sendFilesTo(target, state.selectedFiles);
+    await sendFilesTo(target, filesToSend);
     showToast("Envio concluído");
+    state.selectedFiles = [];
+    el.fileInput.value = "";
+    renderFileQueue();
   } catch (err) {
     showToast(err.message || "Falha no envio");
   } finally {

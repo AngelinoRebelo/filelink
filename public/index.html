@@ -106,9 +106,11 @@
         <div class="transfer-panel">
           <label class="dropzone" id="dropzone" for="fileInput">
             <input type="file" id="fileInput" multiple hidden />
-            <strong>Solte arquivos aqui</strong>
-            <span>ou toque para escolher</span>
+            <strong id="dropzoneTitle">Solte arquivos aqui</strong>
+            <span id="dropzoneHint">ou toque para escolher</span>
           </label>
+
+          <ul class="file-queue" id="fileQueue" aria-live="polite"></ul>
 
           <div class="send-row">
             <label for="targetSelect">Enviar para</label>
@@ -133,10 +135,12 @@
         </div>
         <p class="scan-help">Aponte a câmera para o QR da rede FileLink.</p>
         <div class="scan-frame">
-          <video id="scanVideo" playsinline muted></video>
-          <canvas id="scanCanvas" class="hidden"></canvas>
+          <video id="scanVideo" playsinline webkit-playsinline muted autoplay></video>
+          <canvas id="scanCanvas" class="hidden" aria-hidden="true"></canvas>
+          <div class="scan-reticle" aria-hidden="true"></div>
         </div>
         <p class="scan-status" id="scanStatus">Abrindo câmera…</p>
+        <button type="button" class="btn btn-ghost scan-switch" id="switchCameraBtn">Trocar câmera</button>
       </div>
     </div>
 
